@@ -707,6 +707,17 @@ impl CortexM33 {
                     if i == 15 {
                         if Self::is_exc_return(val) {
                             bus.set_burst_mode(false);
+                            // Base-register writeback must land BEFORE the
+                            // exception return unstacks (e.g. `ldmia sp!,
+                            // {..., pc}` / `pop {..., pc}` with EXC_RETURN in
+                            // the pc slot). Upstream returned first, so the
+                            // frame was unstacked from a stale SP.
+                            if w && reglist & (1 << rn) == 0 {
+                                self.regs.r[rn] = match op {
+                                    0b01 => self.regs.r[rn].wrapping_add(count * 4),
+                                    _ => self.regs.r[rn].wrapping_sub(count * 4),
+                                };
+                            }
                             return self.exit_exception(val, bus);
                         }
                         self.regs.set_pc(val & !1);
@@ -875,6 +886,63 @@ impl CortexM33 {
             }
             self.exclusive_address = None;
             return 2;
+        }
+        // LOCAL PATCH (AD9850 probe): ARMv8-M acquire/release family, which
+        // pico-sdk 2.x uses (hw_claim_*, spin locks). Ordering is irrelevant
+        // for this single-bus emulator, so these map to plain/exclusive ops.
+        //   LDAEXB/H/LDAEX: E8D n | Rt F {C,D,E} F
+        //   STLEXB/H/STLEX: E8C n | Rt F {C,D,E} Rd
+        //   LDAB/H/LDA:     E8D n | Rt F {8,9,A} F
+        //   STLB/H/STL:     E8C n | Rt F {8,9,A} F
+        if (hw0 & 0xFFF0 == 0xE8D0 || hw0 & 0xFFF0 == 0xE8C0) && (hw1 >> 8) & 0xF == 0xF {
+            let sz = (hw1 >> 4) & 0xF;
+            let rn = (hw0 & 0xF) as usize;
+            let rt = ((hw1 >> 12) & 0xF) as usize;
+            let addr = self.regs.r[rn];
+            let load = hw0 & 0xFFF0 == 0xE8D0;
+            match (load, sz) {
+                (true, 0xC | 0xD | 0xE) if hw1 & 0xF == 0xF => {
+                    self.regs.r[rt] = match sz {
+                        0xC => self.bus_read8(addr, bus) as u32,
+                        0xD => self.bus_read16(addr, bus) as u32,
+                        _ => self.bus_read32(addr, bus),
+                    };
+                    self.exclusive_address = Some(addr & !3);
+                    return 2;
+                }
+                (false, 0xC | 0xD | 0xE) => {
+                    let rd = (hw1 & 0xF) as usize;
+                    if self.exclusive_address == Some(addr & !3) {
+                        match sz {
+                            0xC => self.bus_write8(addr, self.regs.r[rt] as u8, bus),
+                            0xD => self.bus_write16(addr, self.regs.r[rt] as u16, bus),
+                            _ => self.bus_write32(addr, self.regs.r[rt], bus),
+                        }
+                        self.regs.r[rd] = 0;
+                    } else {
+                        self.regs.r[rd] = 1;
+                    }
+                    self.exclusive_address = None;
+                    return 2;
+                }
+                (true, 0x8 | 0x9 | 0xA) if hw1 & 0xF == 0xF => {
+                    self.regs.r[rt] = match sz {
+                        0x8 => self.bus_read8(addr, bus) as u32,
+                        0x9 => self.bus_read16(addr, bus) as u32,
+                        _ => self.bus_read32(addr, bus),
+                    };
+                    return 2;
+                }
+                (false, 0x8 | 0x9 | 0xA) if hw1 & 0xF == 0xF => {
+                    match sz {
+                        0x8 => self.bus_write8(addr, self.regs.r[rt] as u8, bus),
+                        0x9 => self.bus_write16(addr, self.regs.r[rt] as u16, bus),
+                        _ => self.bus_write32(addr, self.regs.r[rt], bus),
+                    }
+                    return 2;
+                }
+                _ => {}
+            }
         }
         // (Falls through to LDRD/STRD for any other unrecognized pattern)
 

@@ -564,8 +564,13 @@ impl CortexM33 {
     /// coproc is 10 or 11.
     pub(crate) fn fpu_execute<B: CoreBus>(&mut self, hw0: u16, hw1: u16, bus: &mut B) -> u32 {
         let coproc = ((hw1 >> 8) & 0xF) as u8;
-        if coproc == 11 {
-            // Double-precision not present on RP2350
+        // Double-precision *data processing* is not present on RP2350 (FPv5-SP),
+        // but the D-register memory transfers (VLDR/VSTR/VLDM/VSTM/VPUSH/VPOP
+        // .64) are legal on an SP-only FPU and pico-sdk emits them
+        // (e.g. `vpush {d8}` in IRQ handlers). Allow only the LDC/STC family
+        // (hw0[11:8] != 0xE) for coproc 11.
+        let dp = coproc == 11;
+        if dp && (hw0 >> 8) & 0xF == 0xE {
             return self.thumb32_undefined(hw0, hw1, bus);
         }
 
@@ -614,7 +619,11 @@ impl CortexM33 {
             }
         } else {
             // Load/store (single or multiple)
-            self.fpu_load_store(hw0, hw1, bus)
+            if dp {
+                self.fpu_load_store_dp(hw0, hw1, bus)
+            } else {
+                self.fpu_load_store(hw0, hw1, bus)
+            }
         }
     }
 
@@ -1125,6 +1134,65 @@ impl CortexM33 {
     // For multiple (VLDM/VSTM): P and U determine direction
     //   Sd = (Vd << 1) | D  (first register)
     //   Count = imm8 (number of single registers)
+
+    /// Double-register memory transfers on an SP-only FPU: VLDR/VSTR.64 and
+    /// VLDM/VSTM/VPUSH/VPOP of D registers. A D register is two consecutive
+    /// S registers (Dn = S[2n], S[2n+1]); imm8 counts 32-bit words.
+    fn fpu_load_store_dp<B: CoreBus>(&mut self, hw0: u16, hw1: u16, bus: &mut B) -> u32 {
+        let p = (hw0 >> 8) & 1;
+        let u = (hw0 >> 7) & 1;
+        let w = (hw0 >> 5) & 1;
+        let l = (hw0 >> 4) & 1;
+        let rn = (hw0 & 0xF) as usize;
+        let d_reg = ((((hw0 >> 6) & 1) as usize) << 4) | (((hw1 >> 12) & 0xF) as usize);
+        let first = d_reg * 2; // index of S[2d]
+        let imm8 = (hw1 & 0xFF) as u32;
+        let base = if rn == 15 { self.read_pc() & !0x3 } else { self.regs.r[rn] };
+
+        if p == 1 && w == 0 {
+            // VLDR.64 / VSTR.64
+            let off = imm8 << 2;
+            let addr = if u != 0 { base.wrapping_add(off) } else { base.wrapping_sub(off) };
+            if first + 1 >= 32 {
+                return 1;
+            }
+            if l != 0 {
+                self.regs.s[first] = f32::from_bits(self.bus_read32(addr, bus));
+                self.regs.s[first + 1] = f32::from_bits(self.bus_read32(addr.wrapping_add(4), bus));
+                3
+            } else {
+                self.bus_write32(addr, self.regs.s[first].to_bits(), bus);
+                self.bus_write32(addr.wrapping_add(4), self.regs.s[first + 1].to_bits(), bus);
+                2
+            }
+        } else {
+            let count = imm8 as usize; // words (2 per D register)
+            if count == 0 || count % 2 != 0 {
+                return self.thumb32_undefined(hw0, hw1, bus);
+            }
+            let mut addr = if u != 0 { base } else { base.wrapping_sub((count as u32) << 2) };
+            for i in 0..count {
+                let reg = first + i;
+                if reg >= 32 {
+                    break;
+                }
+                if l != 0 {
+                    self.regs.s[reg] = f32::from_bits(self.bus_read32(addr, bus));
+                } else {
+                    self.bus_write32(addr, self.regs.s[reg].to_bits(), bus);
+                }
+                addr = addr.wrapping_add(4);
+            }
+            if w != 0 {
+                self.regs.r[rn] = if u != 0 {
+                    base.wrapping_add((count as u32) << 2)
+                } else {
+                    base.wrapping_sub((count as u32) << 2)
+                };
+            }
+            if l != 0 { 1 + count as u32 } else { count as u32 }
+        }
+    }
 
     fn fpu_load_store<B: CoreBus>(&mut self, hw0: u16, hw1: u16, bus: &mut B) -> u32 {
         let p = (hw0 >> 8) & 1;

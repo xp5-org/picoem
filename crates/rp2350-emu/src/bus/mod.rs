@@ -1126,7 +1126,15 @@ impl Bus {
         // TICKS runs unconditionally — there is no RESETS bit for the
         // tick generator (it is bus-level plumbing). Advance all six
         // domains; consumers (TIMER0/TIMER1/RISCV-MTIME) drain edges.
-        self.ticks.advance_all(sys_clks);
+        // LOCAL PATCH (AD9850 probe): TICKS divides clk_ref (12 MHz XOSC),
+        // not clk_sys. Upstream advanced it by sys cycles, so with a 150 MHz
+        // sys clock the TIMER ran 12.5x fast. Convert sys cycles -> ref cycles.
+        let sys_hz = self.clock_tree.sys_clk_hz.max(1) as u64;
+        let ref_hz = self.clock_tree.ref_clk_hz as u64;
+        let acc = self.ticks.ref_frac + (sys_clks as u64) * ref_hz;
+        let ref_cycles = (acc / sys_hz) as u32;
+        self.ticks.ref_frac = acc % sys_hz;
+        self.ticks.advance_all(ref_cycles);
 
         // MTIME (SIO §3.1.8) — drain RISCV TICKS edges and advance the
         // RISC-V platform timer. `Sio::tick_mtime_from_ticks` picks

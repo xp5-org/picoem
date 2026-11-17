@@ -144,6 +144,8 @@ impl Domain {
 /// TICKS register storage — six independent domains.
 pub struct TicksRegs {
     pub domains: [Domain; DOMAIN_COUNT],
+    /// LOCAL PATCH: fractional clk_ref cycles carried between quanta.
+    pub ref_frac: u64,
 }
 
 impl TicksRegs {
@@ -153,6 +155,7 @@ impl TicksRegs {
     pub fn new_hardware_reset() -> Self {
         Self {
             domains: [Domain::default(); DOMAIN_COUNT],
+            ref_frac: 0,
         }
     }
 

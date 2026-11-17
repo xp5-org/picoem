@@ -1150,6 +1150,19 @@ impl Emulator {
                     {
                         self.bus.atomics.clear_wfe_waiting(i);
                     }
+                    // LOCAL PATCH (AD9850 probe): ARMv8-M also wakes WFE on a
+                    // pending+enabled exception (interrupt entry). Upstream only
+                    // wakes on the event flag, so alarm-IRQ based sleep_ms()
+                    // never returns. Check both the raw atomic mask and the
+                    // already-merged NVIC pending state.
+                    if self.bus.atomics.is_wfe_waiting(i) {
+                        let pending = self.bus.atomics.irq_pending_load(i);
+                        if (pending != 0 && arm[i].ppb.any_pending_enabled(pending))
+                            || arm[i].ppb.highest_priority_pending_irq().is_some()
+                        {
+                            self.bus.atomics.clear_wfe_waiting(i);
+                        }
+                    }
                     // WFI wake: enabled pending IRQ clears WFI sleep.
                     // The peek is non-consuming; the next step() will
                     // merge via `take_irq_pending`.
@@ -1660,6 +1673,9 @@ mod tests;
 
 #[cfg(test)]
 mod tests_stage3_thumb32;
+
+#[cfg(test)]
+mod tests_sdk_runtime;
 
 // ---------------------------------------------------------------------------
 // Stage 4: residue branch coverage for the top-level `lib.rs` (Emulator,

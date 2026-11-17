@@ -291,6 +291,9 @@ fn emulator_reset_restores_post_bootrom_ticks_cycles() {
 #[test]
 fn tick_peripherals_advances_timer0_after_ticks_enable() {
     let mut bus = Bus::new();
+    // TICKS divides clk_ref (12 MHz), not clk_sys. Pin sys = ref = 12 MHz so
+    // these tests keep their 12-sys-clks-per-µs arithmetic.
+    bus.seed_sys_clk_hz(12_000_000);
     let ticks_ctrl_t0 = TICKS_BASE + DOMAIN_TIMER0 as u32 * DOMAIN_STRIDE;
     bus.write32(ticks_ctrl_t0, CTRL_ENABLE, 0);
     bus.tick_peripherals(120);
@@ -319,6 +322,9 @@ fn tick_peripherals_timer0_halts_when_ticks_cycles_zero() {
 #[test]
 fn tick_peripherals_alarm_match_raises_irq_via_assert_shared() {
     let mut bus = Bus::new();
+    // TICKS divides clk_ref (12 MHz), not clk_sys. Pin sys = ref = 12 MHz so
+    // these tests keep their 12-sys-clks-per-µs arithmetic.
+    bus.seed_sys_clk_hz(12_000_000);
     let ticks_ctrl_t0 = TICKS_BASE + DOMAIN_TIMER0 as u32 * DOMAIN_STRIDE;
     bus.write32(ticks_ctrl_t0, CTRL_ENABLE, 0);
     bus.write32(TIMER0_BASE + INTE_OFFSET, 0x1, 0);
@@ -342,6 +348,9 @@ fn tick_peripherals_alarm_match_raises_irq_via_assert_shared() {
 #[test]
 fn tick_peripherals_timer1_fires_on_its_own_irq_base() {
     let mut bus = Bus::new();
+    // TICKS divides clk_ref (12 MHz), not clk_sys. Pin sys = ref = 12 MHz so
+    // these tests keep their 12-sys-clks-per-µs arithmetic.
+    bus.seed_sys_clk_hz(12_000_000);
     let ticks_ctrl_t1 = TICKS_BASE + DOMAIN_TIMER1 as u32 * DOMAIN_STRIDE;
     bus.write32(ticks_ctrl_t1, CTRL_ENABLE, 0);
     bus.write32(TIMER1_BASE + INTE_OFFSET, 0x1, 0);
@@ -356,6 +365,9 @@ fn tick_peripherals_timer1_fires_on_its_own_irq_base() {
 #[test]
 fn emulator_step_calls_tick_peripherals_each_iteration() {
     let mut emu = Emulator::new(crate::Config::default());
+    // TICKS divides clk_ref (12 MHz), not clk_sys. Pin sys = ref = 12 MHz so
+    // these tests keep their 12-sys-clks-per-µs arithmetic.
+    emu.bus.seed_sys_clk_hz(12_000_000);
     {
         let arm = emu.cores.expect_arm_mut();
         arm[0].halt();
@@ -394,6 +406,9 @@ fn ticks_cycles_change_preserves_timer_alarms() {
     // (datasheet §12.8 — alarms count against the µs timer regardless
     // of the divider).
     let mut bus = Bus::new();
+    // TICKS divides clk_ref (12 MHz), not clk_sys. Pin sys = ref = 12 MHz so
+    // these tests keep their 12-sys-clks-per-µs arithmetic.
+    bus.seed_sys_clk_hz(12_000_000);
     let ticks_ctrl_t0 = TICKS_BASE + DOMAIN_TIMER0 as u32 * DOMAIN_STRIDE;
     bus.write32(ticks_ctrl_t0, CTRL_ENABLE, 0);
     bus.write32(TIMER0_BASE + ALARM0_OFFSET, 100, 0);
@@ -481,4 +496,40 @@ fn ticks_held_timer_write_discarded_via_bus_guard() {
     bus.write32(ticks_ctrl_t0, CTRL_ENABLE, 0);
     // TICKS accepts the write even though TIMER0 is held.
     assert_ne!(bus.read32(ticks_ctrl_t0, 0) & CTRL_ENABLE, 0);
+}
+
+// ----------------------------------------------------------------------------
+// TICKS counts clk_ref cycles, not clk_sys cycles
+// ----------------------------------------------------------------------------
+
+/// Regression: upstream advanced TICKS by sys cycles, so at the post-bootrom
+/// 150 MHz sys / 12 MHz ref the TIMER ran 12.5x fast (1 µs per 12 sys
+/// cycles instead of per 150).
+#[test]
+fn ticks_follow_clk_ref_not_clk_sys() {
+    let mut bus = Bus::new();
+    assert_eq!(bus.sys_clk_hz(), 150_000_000);
+    assert_eq!(bus.ref_clk_hz(), 12_000_000);
+    let ticks_ctrl_t0 = TICKS_BASE + DOMAIN_TIMER0 as u32 * DOMAIN_STRIDE;
+    bus.write32(ticks_ctrl_t0, CTRL_ENABLE, 0);
+    // 1500 sys cycles @150 MHz = 10 µs = 120 ref cycles = 10 ticks (CYCLES=12).
+    bus.tick_peripherals(1500);
+    assert_eq!(bus.read32(TIMER0_BASE + TIMERAWL_OFFSET, 0), 10);
+}
+
+/// The sys->ref conversion keeps its fractional remainder across quanta, so
+/// 64-cycle quanta (5.12 ref cycles each) sum to the exact elapsed time.
+#[test]
+fn ticks_fractional_ref_cycles_accumulate_across_quanta() {
+    let mut bus = Bus::new();
+    let ticks_ctrl_t0 = TICKS_BASE + DOMAIN_TIMER0 as u32 * DOMAIN_STRIDE;
+    bus.write32(ticks_ctrl_t0, CTRL_ENABLE, 0);
+    // 150_000 sys cycles = 1 ms exactly, delivered in 64-cycle quanta + tail.
+    let mut left = 150_000u32;
+    while left > 0 {
+        let n = left.min(64);
+        bus.tick_peripherals(n);
+        left -= n;
+    }
+    assert_eq!(bus.read32(TIMER0_BASE + TIMERAWL_OFFSET, 0), 1000);
 }

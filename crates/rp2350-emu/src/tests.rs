@@ -11442,14 +11442,15 @@ mod stage1_execute_coverage {
 
     // ---- CPS / PRIMASK / FAULTMASK ----
 
-    // line 662: CPS affect_i branch (bit 0 set). CPSIE I (im=0, affect I).
+    // CPS affect_i branch. ARMv8-M CPS T1 = 1011 0110 011 im 0 I F, so
+    // bit 1 = I (PRIMASK) and bit 0 = F (FAULTMASK). CPSIE I (im=0, I).
     #[test]
     fn cpsie_i_clears_primask() {
         let mut c = CortexM33::for_test(0);
         c.regs.primask = 1;
-        // CPSIE I: bit 4 = 0 (enable → im=0), bit 0 = 1.
-        // Base 0xB660 | 0x01 = 0xB661
-        c.execute_one(0xB661);
+        // CPSIE I: bit 4 = 0 (enable → im=0), bit 1 = 1.
+        // Base 0xB660 | 0x02 = 0xB662
+        c.execute_one(0xB662);
         assert_eq!(c.regs.primask, 0, "CPSIE clears PRIMASK");
     }
 
@@ -11457,10 +11458,37 @@ mod stage1_execute_coverage {
     fn cpsid_i_sets_primask() {
         let mut c = CortexM33::for_test(0);
         c.regs.primask = 0;
-        // CPSID I: bit 4 = 1 (im=1), bit 0 = 1.
-        // Base 0xB660 | 0x10 | 0x01 = 0xB671
-        c.execute_one(0xB671);
+        // CPSID I: bit 4 = 1 (im=1), bit 1 = 1.
+        // Base 0xB660 | 0x10 | 0x02 = 0xB672
+        c.execute_one(0xB672);
         assert_eq!(c.regs.primask, 1);
+    }
+
+    /// Regression: upstream had the I/F bits swapped, so `cpsid i` (the
+    /// most common critical-section opcode, 0xB672) set FAULTMASK and left
+    /// PRIMASK clear — which masked every interrupt except NMI forever.
+    #[test]
+    fn cpsid_i_does_not_touch_faultmask() {
+        let mut c = CortexM33::for_test(0);
+        c.regs.primask = 0;
+        c.regs.faultmask = 0;
+        c.execute_one(0xB672); // CPSID I
+        assert_eq!(c.regs.primask, 1);
+        assert_eq!(c.regs.faultmask, 0, "CPSID I must not set FAULTMASK");
+        c.execute_one(0xB662); // CPSIE I
+        assert_eq!(c.regs.primask, 0);
+        assert_eq!(c.regs.faultmask, 0);
+    }
+
+    #[test]
+    fn cpsid_if_sets_both_masks() {
+        let mut c = CortexM33::for_test(0);
+        c.execute_one(0xB673); // CPSID IF
+        assert_eq!(c.regs.primask, 1);
+        assert_eq!(c.regs.faultmask, 1);
+        c.execute_one(0xB663); // CPSIE IF
+        assert_eq!(c.regs.primask, 0);
+        assert_eq!(c.regs.faultmask, 0);
     }
 
     // line 665: CPS affect_f branch (bit 1 set). CPSIE F / CPSID F.
@@ -11468,8 +11496,8 @@ mod stage1_execute_coverage {
     fn cpsie_f_clears_faultmask() {
         let mut c = CortexM33::for_test(0);
         c.regs.faultmask = 1;
-        // CPSIE F: bit 4 = 0, bit 1 = 1. 0xB660 | 0x02 = 0xB662
-        c.execute_one(0xB662);
+        // CPSIE F: bit 4 = 0, bit 0 = 1. 0xB660 | 0x01 = 0xB661
+        c.execute_one(0xB661);
         assert_eq!(c.regs.faultmask, 0);
     }
 
@@ -11477,8 +11505,8 @@ mod stage1_execute_coverage {
     fn cpsid_f_sets_faultmask() {
         let mut c = CortexM33::for_test(0);
         c.regs.faultmask = 0;
-        // CPSID F: bit 4 = 1, bit 1 = 1. 0xB660 | 0x10 | 0x02 = 0xB672
-        c.execute_one(0xB672);
+        // CPSID F: bit 4 = 1, bit 0 = 1. 0xB660 | 0x10 | 0x01 = 0xB671
+        c.execute_one(0xB671);
         assert_eq!(c.regs.faultmask, 1);
     }
 
@@ -22468,20 +22496,16 @@ mod stage8_workerbus_smoke {
 
     #[test]
     fn wide_misc_cpsie_cpsid() {
-        // Note: the emulator's CPS dispatch treats bit 0 of the opcode as
-        // the "I" (PRIMASK) select (see `execute.rs:660`). The ARMv7-M
-        // architectural encoding uses bit 1 for I; we follow the emulator
-        // convention here so the test exercises the dispatch path.
+        // ARMv8-M CPS T1: bit 1 = I (PRIMASK), bit 0 = F (FAULTMASK).
         let (mut c, mut bus) = core_and_worker_bus();
-        // CPSID with bit 0 set (emulator's "I" bit) and im=1:
-        // 0xB671 = 1011_0110_0111_0001
-        narrow_at(&mut bus, 0x2000_3400, 0xB671);
+        // CPSID I (im=1, I): 0xB672 = 1011_0110_0111_0010
+        narrow_at(&mut bus, 0x2000_3400, 0xB672);
         c.regs.set_pc(0x2000_3400);
         c.step_no_atomics(&mut bus);
         assert_eq!(c.regs.primask, 1);
 
-        // CPSIE: im=0, bit 0 set → clear PRIMASK. 0xB661.
-        narrow_at(&mut bus, 0x2000_3410, 0xB661);
+        // CPSIE I: im=0, bit 1 set → clear PRIMASK. 0xB662.
+        narrow_at(&mut bus, 0x2000_3410, 0xB662);
         c.regs.set_pc(0x2000_3410);
         c.step_no_atomics(&mut bus);
         assert_eq!(c.regs.primask, 0);
