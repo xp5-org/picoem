@@ -782,6 +782,11 @@ impl Dma {
                 || (treq < 64 && (dreqs >> treq) & 1 != 0);
             if ready {
                 self.issue_transfer(i, bus);
+                // A PWM wrap DREQ is a credit, not a level: this
+                // transfer used one up.
+                if (crate::dreq::DREQ_PWM_WRAP0..=crate::dreq::DREQ_PWM_WRAP11).contains(&treq) {
+                    bus.pwm.take_dreq((treq - crate::dreq::DREQ_PWM_WRAP0) as usize);
+                }
             }
         }
     }

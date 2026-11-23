@@ -222,8 +222,8 @@ impl ThreadedEmulator {
             mmio_trace_enabled: _,
             mmio_trace_sink: _,
             pending_cache_invalidations: _,
-            code_pages: _, // LOCAL PATCH (speed): Serial-path SMC filter; workers keep their own queue
-            deadline_quanta: _, // LOCAL PATCH: Serial-only scheduling option
+            code_pages: _, // Serial-path SMC filter; workers keep their own queue
+            deadline_quanta: _, // Serial-only scheduling option
             pending_invalidation_regions: _,
             last_fetch_addr: _,
             warned_addrs: _,
@@ -813,10 +813,9 @@ fn core_worker_body(
                 }
             }
         }
-        // LOCAL PATCH (2026-11-23), same rule as Serial `step_pair_arm`:
-        // time passes while a core sleeps, so a halted / WFE-parked core
-        // resumes in step with the master clock instead of running a
-        // catch-up burst after it wakes.
+        // Same rule as Serial `step_pair_arm`: time passes while a core
+        // sleeps, so a halted / WFE-parked core resumes in step with the
+        // master clock instead of running a catch-up burst after it wakes.
         if core.cycles < target && (shared.atomics.is_halted(idx) || shared.atomics.is_wfe_waiting(idx)) {
             core.cycles = target;
         }
@@ -2129,8 +2128,7 @@ mod tests {
 
         threaded.run_quanta(1);
 
-        // Halted cores' cycles follow the master clock (LOCAL PATCH
-        // 2026-11-23: time passes while asleep), so systick_advance(q)
+        // Halted cores' cycles follow the master clock, so systick_advance(q)
         // must have rewritten last_systick_cycles from (42, 99) to (q, q).
         let q = threaded.step_quantum as u64;
         assert_eq!(
@@ -3221,8 +3219,8 @@ mod tests {
             // a correctly-broken loop because the first re-entry top-of-
             // quantum check would still flag wfe_waiting. The cycle count
             // is the cleaner signal: only one instruction executed.
-            // (LOCAL PATCH 2026-11-23: a parked core's `cycles` now follows
-            // the master clock, so count executed cycles instead.)
+            // A parked core's `cycles` follows the master clock, so count
+            // executed cycles instead.
             let core_cycles = threaded.core0.as_ref().unwrap().counters.decode_execute_cycles;
             assert!(
                 core_cycles >= 1 && core_cycles < threaded.step_quantum as u64,

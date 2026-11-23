@@ -432,11 +432,16 @@ fn f32_to_u32_rtz(val: f32) -> u32 {
     val as u32
 }
 
+/// Extra rounding-mode value for the FPv5 VRINTA / VCVTA forms: round to
+/// nearest, ties away from zero. It is not an FPSCR.RMode encoding.
+const RMODE_TIES_AWAY: u32 = 0b100;
+
 fn f32_to_i32_rmode(val: f32, rmode: u32) -> i32 {
     if val.is_nan() {
         return 0;
     }
     let rounded = match rmode {
+        RMODE_TIES_AWAY => val.round(),
         0b00 => val.round_ties_even(),
         0b01 => val.ceil(),
         0b10 => val.floor(),
@@ -456,6 +461,7 @@ fn f32_to_u32_rmode(val: f32, rmode: u32) -> u32 {
         return 0;
     }
     let rounded = match rmode {
+        RMODE_TIES_AWAY => val.round(),
         0b00 => val.round_ties_even(),
         0b01 => val.ceil(),
         0b10 => val.floor(),
@@ -564,21 +570,21 @@ impl CortexM33 {
     /// coproc is 10 or 11.
     pub(crate) fn fpu_execute<B: CoreBus>(&mut self, hw0: u16, hw1: u16, bus: &mut B) -> u32 {
         let coproc = ((hw1 >> 8) & 0xF) as u8;
-        // Double-precision *data processing* is not present on RP2350 (FPv5-SP),
-        // but the D-register memory transfers (VLDR/VSTR/VLDM/VSTM/VPUSH/VPOP
-        // .64) are legal on an SP-only FPU and pico-sdk emits them
-        // (e.g. `vpush {d8}` in IRQ handlers). Allow only the LDC/STC family
-        // (hw0[11:8] != 0xE) for coproc 11.
+        // Double-precision *data processing* is not present on the FPv5-SP of
+        // RP2350, but the D-register memory transfers VLDR/VSTR/VLDM/VSTM/VPUSH/
+        // VPOP .64 are legal on an SP-only FPU, and pico-sdk emits them, for
+        // example `vpush {d8}` in IRQ handlers. Allow only the LDC/STC family,
+        // hw0[11:8] != 0xE, for coproc 11.
         let dp = coproc == 11;
         if dp && (hw0 >> 8) & 0xF == 0xE {
             return self.thumb32_undefined(hw0, hw1, bus);
         }
 
-        // Two-register transfers (MCRR/MRRC): hw0 = 1110_1100_010L_Rt2.
+        // Two-register transfers MCRR/MRRC: hw0 = 1110_1100_010L_Rt2.
         //   cp10: VMOV Sm, Sm1, Rt, Rt2 / VMOV Rt, Rt2, Sm, Sm1
-        //   cp11: VMOV Dm, Rt, Rt2      / VMOV Rt, Rt2, Dm     (legal on FPv5-SP-D16;
-        //         clang moves soft-double operands to the __aeabi_* helpers this way)
-        // Dm is the pair (s[2m], s[2m+1]), low word first, as in VLDR/VSTR .64.
+        //   cp11: VMOV Dm, Rt, Rt2      / VMOV Rt, Rt2, Dm; legal on FPv5-SP-D16,
+        //         and clang moves soft-double operands to the __aeabi_* helpers this way.
+        // Dm is the pair s[2m], s[2m+1], low word first, as in VLDR/VSTR .64.
         if hw0 & 0xFFE0 == 0xEC40 {
             let l = (hw0 >> 4) & 1;
             let rt2 = (hw0 & 0xF) as usize;
@@ -666,8 +672,9 @@ impl CortexM33 {
     //   hw0[7]=1  → VMAXNM/VMINNM (hw1[6]=op: 0=max, 1=min; hw0[6:5]=00)
 
     fn fpu_v8m_dp(&mut self, hw0: u16, hw1: u16) -> u32 {
-        // The 0xFE family encodes D at hw0[6] (DDI0553: VSEL = 111111100 D cc Vn,
-        // VMAXNM/VMINNM = 111111101 D 00 Vn), so cc / the zero field are hw0[5:4].
+        // The 0xFE family encodes D at hw0[6], per DDI0553: VSEL = 111111100 D cc
+        // Vn, VMAXNM/VMINNM = 111111101 D 00 Vn. So cc and the zero field are
+        // hw0[5:4].
         let vd = ((hw1 >> 12) & 0xF) as usize;
         let d = ((hw0 >> 6) & 1) as usize;
         let sd = (vd << 1) | d;
@@ -703,6 +710,30 @@ impl CortexM33 {
             } else {
                 fpu_maxnum(sn_val, sm_val)
             };
+            1
+        } else if (hw0 >> 4) & 0x3 == 0b11 && hw0 & 0x8 != 0 && hw1 & 0x0150 == 0x0040 {
+            // Armv8-M FPv5 directed rounding, single precision only: sz = hw1[8] = 0,
+            // since the SP FPU has no D registers. The SDK's M33 cosf/sinf use VRINTN.
+            // 1111 1110 1 D 11 1 op RM | Vd 101 0 s 1 M 0 Vm.
+            //   hw0[2]=0 → VRINT{A,N,P,M}.F32 Sd, Sm, never raises IXC
+            //   hw0[2]=1 → VCVT{A,N,P,M}.{S32,U32}.F32 Sd, Sm; hw1[7]=1 is signed
+            // RM = hw0[1:0]: 00 A ties away, 01 N ties even, 10 P toward +inf, 11 M toward -inf.
+            let rmode = match hw0 & 0x3 {
+                0b00 => RMODE_TIES_AWAY,
+                0b01 => 0b00,
+                0b10 => 0b01,
+                _ => 0b10,
+            };
+            let val = self.regs.s[sm];
+            if hw0 & 0x4 == 0 {
+                let (r, flags) = fpu_vrint(val, rmode, self.regs.fpscr, false);
+                self.regs.fpscr |= flags;
+                self.regs.s[sd] = r;
+            } else if hw1 & 0x80 != 0 {
+                self.regs.s[sd] = f32::from_bits(f32_to_i32_rmode(val, rmode) as u32);
+            } else {
+                self.regs.s[sd] = f32::from_bits(f32_to_u32_rmode(val, rmode));
+            }
             1
         } else {
             self.pending_fault = Some(super::Fault::UsageFault);
@@ -1170,7 +1201,7 @@ impl CortexM33 {
 
     /// Double-register memory transfers on an SP-only FPU: VLDR/VSTR.64 and
     /// VLDM/VSTM/VPUSH/VPOP of D registers. A D register is two consecutive
-    /// S registers (Dn = S[2n], S[2n+1]); imm8 counts 32-bit words.
+    /// S registers, Dn = S[2n], S[2n+1]; imm8 counts 32-bit words.
     fn fpu_load_store_dp<B: CoreBus>(&mut self, hw0: u16, hw1: u16, bus: &mut B) -> u32 {
         let p = (hw0 >> 8) & 1;
         let u = (hw0 >> 7) & 1;
@@ -1199,7 +1230,7 @@ impl CortexM33 {
                 2
             }
         } else {
-            let count = imm8 as usize; // words (2 per D register)
+            let count = imm8 as usize; // words, 2 per D register
             if count == 0 || count % 2 != 0 {
                 return self.thumb32_undefined(hw0, hw1, bus);
             }
@@ -1396,6 +1427,7 @@ fn fpu_vrint(val: f32, rmode: u32, fpscr_in: u32, exact: bool) -> (f32, u32) {
         return (val, flags);
     }
     let rounded = match rmode {
+        RMODE_TIES_AWAY => val.round(),
         0b00 => val.round_ties_even(),
         0b01 => val.ceil(),
         0b10 => val.floor(),

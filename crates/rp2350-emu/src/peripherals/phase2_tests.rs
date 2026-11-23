@@ -260,8 +260,8 @@ fn adc_fifo_irq_routed_when_unmasked() {
 fn pwm_slice0_wrap_latches_intr_bit() {
     let mut bus = Bus::new();
     // Slice 0: CSR.EN, TOP=100.
-    bus.write32(PWM_BASE, CSR_EN, 0); // SLICE_CSR
     bus.write32(PWM_BASE + 0x10, 100, 0); // SLICE_TOP
+    bus.write32(PWM_BASE, CSR_EN, 0); // SLICE_CSR
     bus.write32(PWM_BASE + PWM_EN, 1, 0);
     // 101 sys_clks → one wrap.
     bus.tick_peripherals(101);
@@ -272,8 +272,8 @@ fn pwm_slice0_wrap_latches_intr_bit() {
 #[test]
 fn pwm_slice0_inte0_routes_to_wrap0_irq() {
     let mut bus = Bus::new();
-    bus.write32(PWM_BASE, CSR_EN, 0);
     bus.write32(PWM_BASE + 0x10, 50, 0);
+    bus.write32(PWM_BASE, CSR_EN, 0);
     bus.write32(PWM_BASE + PWM_EN, 1, 0);
     bus.write32(PWM_BASE + INTE0, 1, 0);
     bus.tick_peripherals(60);
@@ -352,8 +352,8 @@ fn resets_guard_held_spi0_discards_writes() {
 fn resets_guard_held_pwm_discards_tick_advance() {
     let mut bus = Bus::new();
     // Program slice 0 first while released, then hold PWM in reset.
-    bus.write32(PWM_BASE, CSR_EN, 0);
     bus.write32(PWM_BASE + 0x10, 100, 0);
+    bus.write32(PWM_BASE, CSR_EN, 0);
     bus.write32(PWM_BASE + PWM_EN, 1, 0);
     bus.write32(RESETS_BASE + 0x2000, 1 << RESET_PWM, 0);
     bus.tick_peripherals(500);

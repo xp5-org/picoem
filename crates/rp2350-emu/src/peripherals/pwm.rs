@@ -122,6 +122,14 @@ pub struct PwmSlice {
     pub top: u16,
     /// Fractional accumulator for the 8.4 fixed-point divider.
     pub frac_accum: u16,
+    /// CC and TOP are double-buffered, as on silicon. Firmware and DMA writes
+    /// land here and take effect at the next wrap while the slice runs, or at
+    /// once while it is stopped. `cc` and `top` above are the live values the
+    /// counter compares against.
+    pub cc_buf: u32,
+    pub top_buf: u16,
+    /// Wraps not yet taken by a DMA channel paced on DREQ_PWM_WRAPn.
+    pub dreq_credit: u32,
 }
 
 impl PwmSlice {
@@ -133,6 +141,9 @@ impl PwmSlice {
             cc: 0,
             top: TOP_RESET as u16,
             frac_accum: 0,
+            cc_buf: 0,
+            top_buf: TOP_RESET as u16,
+            dreq_credit: 0,
         }
     }
 }
@@ -202,6 +213,38 @@ impl PwmRegs {
         }
     }
 
+    /// DREQ_PWM_WRAP0.. bits for every slice with an untaken wrap; slice n is
+    /// bit n.
+    pub fn dreq_bits(&self) -> u16 {
+        let mut b = 0u16;
+        for (i, sl) in self.slices.iter().enumerate() {
+            if sl.dreq_credit != 0 {
+                b |= 1 << i;
+            }
+        }
+        b
+    }
+
+    /// A DMA transfer paced on this slice's wrap DREQ took one credit.
+    pub fn take_dreq(&mut self, slice: usize) {
+        if let Some(sl) = self.slices.get_mut(slice) {
+            sl.dreq_credit = sl.dreq_credit.saturating_sub(1);
+        }
+    }
+
+    /// Output level of one PWM channel in trailing-edge mode: high while
+    /// CTR < CC, inverted by the A/B_INV bits. `tick` does not model
+    /// phase-correct mode, so it uses the same compare.
+    pub fn channel_level(&self, slice: usize, chan_b: bool) -> bool {
+        let sl = &self.slices[slice];
+        let (cc, inv) = if chan_b {
+            (sl.cc >> 16, sl.csr & CSR_B_INV != 0)
+        } else {
+            (sl.cc & 0xFFFF, sl.csr & CSR_A_INV != 0)
+        };
+        ((sl.ctr as u32) < cc) != inv
+    }
+
     pub fn reset(&mut self) {
         let (i0, i1) = (self.nvic_irq_wrap0, self.nvic_irq_wrap1);
         *self = Self::new(i0, i1);
@@ -242,8 +285,8 @@ impl PwmRegs {
                 SLICE_CSR => self.slices[slice].csr,
                 SLICE_DIV => self.slices[slice].div,
                 SLICE_CTR => self.slices[slice].ctr as u32,
-                SLICE_CC => self.slices[slice].cc,
-                SLICE_TOP => self.slices[slice].top as u32,
+                SLICE_CC => self.slices[slice].cc_buf,
+                SLICE_TOP => self.slices[slice].top_buf as u32,
                 _ => 0,
             };
         }
@@ -269,6 +312,14 @@ impl PwmRegs {
                     self.slices[slice].csr = stored & CSR_WRITE_MASK;
                     // PH_ADVANCE / PH_RETARD auto-clear after the pulse.
                     self.slices[slice].csr &= !(CSR_PH_ADVANCE | CSR_PH_RETARD);
+                    // EN aliases the CSR_EN bits, one physical bit per
+                    // slice, so keep the global view in step with this
+                    // slice's CSR_EN.
+                    if self.slices[slice].csr & CSR_EN != 0 {
+                        self.en |= 1 << slice;
+                    } else {
+                        self.en &= !(1 << slice);
+                    }
                 }
                 SLICE_DIV => {
                     let mut stored = self.slices[slice].div;
@@ -285,14 +336,22 @@ impl PwmRegs {
                     self.slices[slice].ctr = stored as u16;
                 }
                 SLICE_CC => {
-                    let mut stored = self.slices[slice].cc;
+                    let sl = &mut self.slices[slice];
+                    let mut stored = sl.cc_buf;
                     apply_alias_rmw(&mut stored, value, alias);
-                    self.slices[slice].cc = stored;
+                    sl.cc_buf = stored;
+                    if sl.csr & CSR_EN == 0 {
+                        sl.cc = stored;
+                    }
                 }
                 SLICE_TOP => {
-                    let mut stored = self.slices[slice].top as u32;
+                    let sl = &mut self.slices[slice];
+                    let mut stored = sl.top_buf as u32;
                     apply_alias_rmw(&mut stored, value, alias);
-                    self.slices[slice].top = stored as u16;
+                    sl.top_buf = stored as u16;
+                    if sl.csr & CSR_EN == 0 {
+                        sl.top = stored as u16;
+                    }
                 }
                 _ => {}
             }
@@ -303,6 +362,15 @@ impl PwmRegs {
                 let mut stored = self.en as u32;
                 apply_alias_rmw(&mut stored, value, alias);
                 self.en = (stored as u16) & SLICE_MASK;
+                // EN is an alias of every slice's CSR_EN, not a second
+                // enable that must also be set.
+                for (i, sl) in self.slices.iter_mut().enumerate() {
+                    if self.en & (1 << i) != 0 {
+                        sl.csr |= CSR_EN;
+                    } else {
+                        sl.csr &= !CSR_EN;
+                    }
+                }
                 self.route_irq(irqs);
             }
             INTR => {
@@ -351,8 +419,8 @@ impl PwmRegs {
     /// convert sys_clk ticks into counter advances via an O(1)
     /// closed-form fractional accumulator.
     pub fn tick(&mut self, cycles: u32, _clock_tree: &ClockTree, irqs: &mut u64) {
-        // LOCAL PATCH (speed, 2026-11-23): no slice enabled -> the loop below
-        // advances nothing; skip straight to IRQ routing (same end state).
+        // No slice enabled -> the loop below advances nothing; skip straight to
+        // IRQ routing, which gives the same end state.
         if cycles == 0 || self.en == 0 {
             self.route_irq(irqs);
             return;
@@ -386,12 +454,22 @@ impl PwmRegs {
             let top = slice.top as u64;
             let period = top + 1;
             let old_ctr = slice.ctr as u64;
-            let new_ctr = (old_ctr + advance as u64) % period;
             let to_first_wrap = period - old_ctr;
             let wrapped = (advance as u64) >= to_first_wrap;
-            slice.ctr = new_ctr as u16;
             if wrapped {
+                // Latch the double-buffered CC/TOP at the wrap and count
+                // every wrap as one DREQ credit, so a quantum spanning
+                // several wraps paces the DMA exactly. The remainder after
+                // the first wrap runs against the new TOP.
+                let wraps_after = (advance as u64 - to_first_wrap) / (slice.top_buf as u64 + 1);
+                slice.cc = slice.cc_buf;
+                slice.top = slice.top_buf;
+                let p2 = slice.top as u64 + 1;
+                slice.ctr = ((advance as u64 - to_first_wrap) % p2) as u16;
+                slice.dreq_credit = slice.dreq_credit.saturating_add(1 + wraps_after as u32);
                 self.latch_wrap(slice_idx);
+            } else {
+                slice.ctr = (old_ctr + advance as u64) as u16;
             }
         }
         self.route_irq(irqs);
@@ -463,8 +541,8 @@ mod tests {
     fn enabled_slice_ctr_advances_one_per_sys_clk() {
         let mut p = new_pwm();
         let mut irqs = 0u64;
-        p.write32(SLICE_CSR, CSR_EN, 0, &mut irqs);
         p.write32(SLICE_TOP, 100, 0, &mut irqs);
+        p.write32(SLICE_CSR, CSR_EN, 0, &mut irqs);
         p.write32(EN, 1, 0, &mut irqs);
         p.tick(50, &default_tree(), &mut irqs);
         assert_eq!(p.slices[0].ctr, 50);
@@ -474,8 +552,8 @@ mod tests {
     fn wrap_at_top_latches_intr_bit() {
         let mut p = new_pwm();
         let mut irqs = 0u64;
-        p.write32(SLICE_CSR, CSR_EN, 0, &mut irqs);
         p.write32(SLICE_TOP, 100, 0, &mut irqs);
+        p.write32(SLICE_CSR, CSR_EN, 0, &mut irqs);
         p.write32(EN, 1, 0, &mut irqs);
         p.tick(101, &default_tree(), &mut irqs);
         assert_eq!(p.intr & 0x1, 0x1);
@@ -486,8 +564,8 @@ mod tests {
     fn inte0_gates_wrap0_nvic_fire() {
         let mut p = new_pwm();
         let mut irqs = 0u64;
-        p.write32(SLICE_CSR, CSR_EN, 0, &mut irqs);
         p.write32(SLICE_TOP, 50, 0, &mut irqs);
+        p.write32(SLICE_CSR, CSR_EN, 0, &mut irqs);
         p.write32(EN, 1, 0, &mut irqs);
         p.write32(INTE0, 1, 0, &mut irqs);
         p.tick(51, &default_tree(), &mut irqs);
@@ -501,8 +579,8 @@ mod tests {
         let mut irqs = 0u64;
         // Slice 8 — upper-group.
         let base = 8 * SLICE_STRIDE;
-        p.write32(base + SLICE_CSR, CSR_EN, 0, &mut irqs);
         p.write32(base + SLICE_TOP, 50, 0, &mut irqs);
+        p.write32(base + SLICE_CSR, CSR_EN, 0, &mut irqs);
         p.write32(EN, 1u32 << 8, 0, &mut irqs);
         p.write32(INTE1, 1, 0, &mut irqs); // bit 0 of INTE1 = slice 8
         p.tick(51, &default_tree(), &mut irqs);
@@ -516,8 +594,8 @@ mod tests {
     fn slice_enable_mask_controls_advance() {
         let mut p = new_pwm();
         let mut irqs = 0u64;
-        p.write32(SLICE_CSR, CSR_EN, 0, &mut irqs);
         p.write32(SLICE_TOP, 100, 0, &mut irqs);
+        p.write32(SLICE_CSR, CSR_EN, 0, &mut irqs);
         // Global mask clear → counter frozen.
         p.write32(EN, 0, 0, &mut irqs);
         p.tick(500, &default_tree(), &mut irqs);
@@ -528,8 +606,8 @@ mod tests {
     fn intr_is_w1c() {
         let mut p = new_pwm();
         let mut irqs = 0u64;
-        p.write32(SLICE_CSR, CSR_EN, 0, &mut irqs);
         p.write32(SLICE_TOP, 10, 0, &mut irqs);
+        p.write32(SLICE_CSR, CSR_EN, 0, &mut irqs);
         p.write32(EN, 1, 0, &mut irqs);
         p.tick(11, &default_tree(), &mut irqs);
         assert_eq!(p.intr & 1, 1);
@@ -541,10 +619,10 @@ mod tests {
     fn multiple_slices_wrap_independently() {
         let mut p = new_pwm();
         let mut irqs = 0u64;
-        p.write32(SLICE_CSR, CSR_EN, 0, &mut irqs);
         p.write32(SLICE_TOP, 10, 0, &mut irqs);
-        p.write32(SLICE_STRIDE + SLICE_CSR, CSR_EN, 0, &mut irqs);
+        p.write32(SLICE_CSR, CSR_EN, 0, &mut irqs);
         p.write32(SLICE_STRIDE + SLICE_TOP, 20, 0, &mut irqs);
+        p.write32(SLICE_STRIDE + SLICE_CSR, CSR_EN, 0, &mut irqs);
         p.write32(EN, 0b0000_0011, 0, &mut irqs);
         p.tick(21, &default_tree(), &mut irqs);
         assert_eq!(p.intr & 0b11, 0b11);

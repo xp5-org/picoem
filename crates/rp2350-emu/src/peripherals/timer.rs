@@ -178,9 +178,8 @@ impl TimerRegs {
     /// `irq_base + n` is set if alarm n fires or remains latched with
     /// INTE enabled. The caller OR's the result into `bus.irq_pending`
     /// / `bus.assert_irq_shared` per HLD V5 §5.3.
-    /// LOCAL PATCH (deadline quanta, 2026-11-23): microsecond edges until
-    /// the earliest armed alarm matches (0 if one already has), or `None`
-    /// if nothing is armed or the timer is paused.
+    /// Microsecond edges until the earliest armed alarm matches: 0 if one
+    /// already has, `None` if nothing is armed or the timer is paused.
     pub fn edges_to_next_alarm(&self) -> Option<u64> {
         if self.pause {
             return None;

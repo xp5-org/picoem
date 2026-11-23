@@ -85,12 +85,12 @@ impl DecodedOp {
     pub(crate) const FLAG_WIDE: u8 = 0b0000_0001;
     pub(crate) const FLAG_PURE: u8 = 0b0000_0010;
     pub(crate) const FLAG_FLAG_ONLY: u8 = 0b0000_0100;
-    /// LOCAL PATCH (speed): BKPT or a hint (WFE / WFI / SEV / YIELD / NOP):
-    /// a pure op that may halt or park its own core.
+    /// BKPT or a hint, one of WFE / WFI / SEV / YIELD / NOP: a pure op that
+    /// may halt or park its own core.
     pub(crate) const FLAG_SLEEPY: u8 = 0b0000_1000;
-    /// LOCAL PATCH (speed): a plain load encoding (no store, no coprocessor,
-    /// no exception return). Lets the idle-loop detector accept impure ops
-    /// that only read; the read wrapper still vets each address.
+    /// A plain load encoding: no store, no coprocessor, no exception return.
+    /// Lets the idle-loop detector accept impure ops that only read; the
+    /// read wrapper still vets each address.
     pub(crate) const FLAG_IDLE_LOAD: u8 = 0b0001_0000;
 
     #[inline(always)]
@@ -537,18 +537,16 @@ pub struct Bus {
     /// evicted along with the narrow slot. Parity with the pre-migration
     /// `Bus::invalidate_pc_range` which cleared `{addr-2, addr [, addr+2]}`.
     pub pending_cache_invalidations: Vec<u32>,
-    /// LOCAL PATCH (speed, 2026-11-23): one bit per 256-byte page of main
-    /// SRAM (0x2000_0000..0x2008_2000) that has ever had an instruction
-    /// fetched into a decode cache. A store to a page with no fetched code
-    /// cannot hit a cached instruction, so `invalidate_pc_range` skips
-    /// queueing it (it would only evict unrelated slots that alias).
-    /// Bits are never cleared (conservative).
+    /// One bit per 256-byte page of main SRAM, 0x2000_0000..0x2008_2000, that
+    /// has ever had an instruction fetched into a decode cache. A store to a
+    /// page with no fetched code cannot hit a cached instruction, so
+    /// `invalidate_pc_range` skips queueing it; the queued entry would only
+    /// evict unrelated slots that alias. Bits are never cleared.
     pub(crate) code_pages: [u64; 33],
-    /// LOCAL PATCH (deadline quanta, 2026-11-23): when true, `Emulator::run`
-    /// (Serial) shortens a quantum so it ends exactly when the next armed
-    /// TIMER0/1 alarm matches. Alarm IRQs then land on their exact cycle
-    /// whatever `step_quantum` is, so large quanta (fast) keep exact alarm
-    /// timing. Default off (upstream behaviour).
+    /// When true, `Emulator::run` in the Serial model shortens a quantum so it
+    /// ends exactly when the next armed TIMER0/1 alarm matches. Alarm IRQs
+    /// then land on their exact cycle whatever `step_quantum` is, so large,
+    /// fast quanta keep exact alarm timing. Default off.
     pub deadline_quanta: bool,
     /// Region-scoped bulk-invalidation bitmask. Set by [`Self::load_bootrom`]
     /// (bit [`invalidation_regions::ROM`]), [`Self::load_flash`] (bit
@@ -1154,10 +1152,9 @@ impl Bus {
     /// V5 does NOT gate this call — the prompt is explicit: "tick
     /// every cycle, unconditionally. A follow-up HLD will add a gate
     /// if `paced_bench_rp2350` regression exceeds the §9.8 threshold."
-    /// LOCAL PATCH (deadline quanta, 2026-11-23): sys cycles until the next
-    /// armed TIMER0/1 alarm matches, mirroring the clk_ref conversion and
-    /// TICKS divider in `tick_peripherals` exactly. `None` if no alarm is
-    /// armed (or its clock is stopped).
+    /// Sys cycles until the next armed TIMER0/1 alarm matches, mirroring the
+    /// clk_ref conversion and TICKS divider in `tick_peripherals` exactly.
+    /// `None` if no alarm is armed or its clock is stopped.
     pub(crate) fn sys_cycles_to_next_timer_alarm(&self) -> Option<u64> {
         let sys_hz = self.clock_tree.sys_clk_hz.max(1) as u64;
         let ref_hz = self.clock_tree.ref_clk_hz as u64;
@@ -1186,14 +1183,13 @@ impl Bus {
         // TICKS runs unconditionally — there is no RESETS bit for the
         // tick generator (it is bus-level plumbing). Advance all six
         // domains; consumers (TIMER0/TIMER1/RISCV-MTIME) drain edges.
-        // LOCAL PATCH (AD9850 probe): TICKS divides clk_ref (12 MHz XOSC),
-        // not clk_sys. Upstream advanced it by sys cycles, so with a 150 MHz
-        // sys clock the TIMER ran 12.5x fast. Convert sys cycles -> ref cycles.
+        // TICKS divides clk_ref, the 12 MHz XOSC, not clk_sys: convert sys
+        // cycles to ref cycles.
         let sys_hz = self.clock_tree.sys_clk_hz.max(1) as u64;
         let ref_hz = self.clock_tree.ref_clk_hz as u64;
         let mut acc = self.ticks.ref_frac + (sys_clks as u64) * ref_hz;
-        // Subtract rather than divide for the usual small quantum (ref is
-        // 12 MHz vs 150 MHz sys: ~5 ref cycles per 64 sys); same result.
+        // Subtract rather than divide for the usual small quantum: ref is 12 MHz
+        // against 150 MHz sys, about 5 ref cycles per 64 sys. Same result.
         let ref_cycles = if acc < 8 * sys_hz {
             let mut n = 0u32;
             while acc >= sys_hz {
@@ -1546,9 +1542,9 @@ impl Bus {
     /// a 4-byte write we push `{addr, addr+2}` so the combined coverage
     /// is `{addr-2, addr, addr+2}` — parity with the pre-migration
     /// `invalidate_pc_range(addr, 4)` sweep.
-    /// Physical main-SRAM page of `addr` (any atomic alias, and the
-    /// RISC-V oracle's 0x8 mirror, map to the same page as the decode
-    /// cache's slot index does), or `None` outside main SRAM.
+    /// Physical main-SRAM page of `addr`, or `None` outside main SRAM. Every
+    /// atomic alias and the RISC-V oracle's 0x8 mirror map to the same page,
+    /// as the decode cache's slot index does.
     #[inline(always)]
     fn sram_code_page(addr: u32) -> Option<usize> {
         let a = canon_oracle_addr(addr);
@@ -1559,8 +1555,8 @@ impl Bus {
         if off < 0x8_2000 { Some((off >> 8) as usize) } else { None }
     }
 
-    /// Record that `pc` (and a possible second halfword) was fetched into
-    /// a decode cache. See [`Self::code_pages`].
+    /// Records that `pc` and a possible second halfword were fetched into a
+    /// decode cache. See [`Self::code_pages`].
     #[inline]
     pub(crate) fn note_code_fetch(&mut self, pc: u32) {
         for a in [pc, pc.wrapping_add(3)] {
@@ -3479,6 +3475,10 @@ impl Bus {
                 bits |= 1u64 << (20 + sm as u64); // DREQ 20..23
             }
         }
+
+        // PWM wrap DREQs 32..43: one credit per wrap, and the DMA takes one per
+        // paced transfer in `Dma::issue_transfer`.
+        bits |= (self.pwm.dreq_bits() as u64) << crate::dreq::DREQ_PWM_WRAP0;
 
         // SPI0/1 TX/RX (DREQ 24..27).
         if self.spi[0].tx_dreq() {

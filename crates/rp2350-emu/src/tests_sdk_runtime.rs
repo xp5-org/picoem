@@ -1,17 +1,16 @@
-//! Regression tests for behaviours that pico-sdk 2.x firmware depends on
-//! (found by booting a real SDK image, an RP2350 DDS modulator, end to end):
+//! Regression tests for behaviours that pico-sdk 2.x firmware depends on:
 //!
-//! * ARMv8-M acquire/release load/store family (`LDAEX*`, `STLEX*`,
-//!   `LDA*`, `STL*`) — emitted by `hw_claim_*` and the SDK spin locks.
+//! * ARMv8-M acquire/release load/store family `LDAEX*`, `STLEX*`,
+//!   `LDA*`, `STL*`, emitted by `hw_claim_*` and the SDK spin locks.
 //! * `WFE` wakes on a pending + enabled interrupt, not only the event flag.
 //! * `LDM`/`POP` that loads PC with an EXC_RETURN value must write the base
 //!   register back *before* unstacking the exception frame.
-//! * D-register memory transfers (`VPUSH`/`VPOP`/`VLDR`/`VSTR` on `Dn`) are
+//! * D-register memory transfers, `VPUSH`/`VPOP`/`VLDR`/`VSTR` on `Dn`, are
 //!   legal on an SP-only FPU; double-precision data processing is not.
 //!
-//! (CPS I/F bit order and TICKS-follows-clk_ref have their regression tests
+//! CPS I/F bit order and TICKS-follows-clk_ref have their regression tests
 //! next to the existing CPS tests in `tests.rs` and in
-//! `peripherals/phase1_tests.rs`.)
+//! `peripherals/phase1_tests.rs`.
 
 use crate::bus::Bus;
 use crate::core::CortexM33;
@@ -27,8 +26,8 @@ fn core_and_bus() -> (CortexM33, Bus) {
 // Acquire / release family
 // ---------------------------------------------------------------------------
 
-/// `LDAEXB r0,[r1]` / `STLEXB r2,r3,[r1]` — the exact opcodes pico-sdk emits
-/// in `hw_claim_or_assert` (`e8d4 6fcf` / `e8c4 0f46` style).
+/// `LDAEXB r0,[r1]` / `STLEXB r2,r3,[r1]`: the exact opcodes pico-sdk emits
+/// in `hw_claim_or_assert`, in the `e8d4 6fcf` / `e8c4 0f46` style.
 #[test]
 fn ldaexb_stlexb_roundtrip() {
     let (mut c, mut bus) = core_and_bus();
@@ -42,7 +41,7 @@ fn ldaexb_stlexb_roundtrip() {
     assert!(!c.has_pending_fault(), "LDAEXB must not be UNDEFINED");
 
     c.set_reg(3, 0x99);
-    c.set_reg(2, 0xFFFF_FFFF); // status must be *written* (0), not left at 0
+    c.set_reg(2, 0xFFFF_FFFF); // status must be *written* as 0, not left at 0
     // STLEXB r2,r3,[r1]: Rt=3, hw1[11:4]=0xFC, Rd=2.
     c.execute_one_wide_with_bus(0xE8C1, (3 << 12) | 0x0FC0 | 2, &mut bus);
     assert_eq!(c.reg(2), 0, "store-exclusive succeeds after matching load");
@@ -94,8 +93,8 @@ fn stlexb_without_monitor_fails() {
     assert_eq!(bus.read8(0x2000_0050, 0), 0x11);
 }
 
-/// Plain acquire/release (`LDAB`/`LDAH`/`LDA`, `STLB`/`STLH`/`STL`) — no
-/// monitor involved. `stlb ip,[r3]` (`e8c3 cf8f`) is the SDK's lock release.
+/// Plain acquire/release `LDAB`/`LDAH`/`LDA`, `STLB`/`STLH`/`STL`, with no
+/// monitor involved. `stlb ip,[r3]` = `e8c3 cf8f` is the SDK's lock release.
 #[test]
 fn lda_stl_plain_variants() {
     let (mut c, mut bus) = core_and_bus();
@@ -122,8 +121,8 @@ fn lda_stl_plain_variants() {
 // WFE wake on pending + enabled interrupt
 // ---------------------------------------------------------------------------
 
-/// pico-sdk `sleep_ms` ends in `wfe` and relies on the alarm IRQ (not an
-/// explicit SEV) to wake the core.
+/// pico-sdk `sleep_ms` ends in `wfe` and relies on the alarm IRQ, not an
+/// explicit SEV, to wake the core.
 #[test]
 fn wfe_wakes_on_pending_enabled_irq() {
     let mut emu = Emulator::new(Config::default());
@@ -156,9 +155,8 @@ fn wfe_stays_asleep_when_pending_irq_is_disabled() {
 // ---------------------------------------------------------------------------
 
 /// Handler epilogue `push {r4,lr}` ... `ldmia sp!,{r4,pc}` with
-/// LR = EXC_RETURN. Upstream took the exception return before the base
-/// register writeback, so the frame was unstacked from SP-8 and the core
-/// ran off with garbage. The exit must see the post-writeback SP.
+/// LR = EXC_RETURN. The exception return must see the post-writeback SP;
+/// unstacking from SP-8 would load a garbage frame.
 #[test]
 fn ldmia_pc_exc_return_writes_back_sp_before_unstacking() {
     let (mut c, mut bus) = core_and_bus();
@@ -175,11 +173,11 @@ fn ldmia_pc_exc_return_writes_back_sp_before_unstacking() {
 
     c.regs.r[14] = 0xFFFF_FFF9; // EXC_RETURN: thread, MSP, basic frame
     c.set_reg(4, 0x4444_4444);
-    // STMDB sp!,{r4,lr}  (push {r4,lr}) = e92d 4010
+    // STMDB sp!,{r4,lr} = push {r4,lr} = e92d 4010
     c.execute_one_wide_with_bus(0xE92D, 0x4010, &mut bus);
     assert_eq!(c.regs.r[13], sp_in_handler - 8);
     c.set_reg(4, 0);
-    // LDMIA sp!,{r4,pc}  (pop {r4,pc}) = e8bd 8010
+    // LDMIA sp!,{r4,pc} = pop {r4,pc} = e8bd 8010
     c.execute_one_wide_with_bus(0xE8BD, 0x8010, &mut bus);
 
     assert_eq!(c.regs.ipsr(), 0, "returned to thread mode");
@@ -191,8 +189,8 @@ fn ldmia_pc_exc_return_writes_back_sp_before_unstacking() {
 // D-register transfers on an SP-only FPU
 // ---------------------------------------------------------------------------
 
-/// `vpush {d8}` / `vpop {d8}` — the SDK's IRQ-handler prologue/epilogue
-/// (`ed2d 8b02` / `ecbd 8b02`). Dn maps to S[2n], S[2n+1].
+/// `vpush {d8}` / `vpop {d8}`: the SDK's IRQ-handler prologue/epilogue,
+/// `ed2d 8b02` / `ecbd 8b02`. Dn maps to S[2n], S[2n+1].
 #[test]
 fn vpush_vpop_d8_roundtrip() {
     let (mut c, mut bus) = core_and_bus();
@@ -231,8 +229,8 @@ fn vstr_vldr_d8_64bit() {
     assert_eq!(c.regs.s[17].to_bits(), 0xBBBB_0002);
 }
 
-/// Only the memory transfers are legal: double-precision *data processing*
-/// (here `vadd.f64 d0,d1,d2`, `ee31 0b02`) is still UNDEFINED on RP2350.
+/// Only the memory transfers are legal: double-precision *data processing*,
+/// here `vadd.f64 d0,d1,d2` = `ee31 0b02`, is still UNDEFINED on RP2350.
 #[test]
 fn double_precision_data_processing_still_undefined() {
     let (mut c, mut bus) = core_and_bus();

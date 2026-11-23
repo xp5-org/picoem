@@ -206,18 +206,18 @@ fn classify_thumb32_branch_misc_pure(hw0: u16, hw1: u16) -> bool {
     }
 }
 
-/// LOCAL PATCH (speed, 2026-11-23): plain load encodings the idle-loop
-/// detector may accept inside a poll loop. Conservative: anything not
-/// listed (stores, LDM with writeback to PC, POP {pc}, exclusive / ordered
-/// loads, coprocessor, table branches) is treated as a side effect.
+/// Plain load encodings the idle-loop detector may accept inside a poll
+/// loop. Anything not listed counts as a side effect: stores, LDM with
+/// writeback to PC, POP {pc}, exclusive and ordered loads, coprocessor
+/// ops, table branches.
 pub(crate) fn is_idle_load_encoding(hw0: u16, _hw1: u16, wide: bool) -> bool {
     if !wide {
         match hw0 >> 11 {
-            0b01001 => true,          // LDR (literal)
-            0b01101 => true,          // LDR (imm)
-            0b01111 => true,          // LDRB (imm)
-            0b10001 => true,          // LDRH (imm)
-            0b10011 => true,          // LDR (SP)
+            0b01001 => true,          // LDR literal
+            0b01101 => true,          // LDR imm
+            0b01111 => true,          // LDRB imm
+            0b10001 => true,          // LDRH imm
+            0b10011 => true,          // LDR SP-relative
             0b01010 | 0b01011 => {
                 // load/store register offset: opB = bits [11:9];
                 // 011 LDRSB, 100 LDR, 101 LDRH, 110 LDRB, 111 LDRSH
@@ -230,7 +230,7 @@ pub(crate) fn is_idle_load_encoding(hw0: u16, _hw1: u16, wide: bool) -> bool {
         // LDR{,B,H,SB,SH}.W: imm12 forms and the imm8 / register / literal group.
         matches!(hw0 & 0xFFF0, 0xF8D0 | 0xF890 | 0xF8B0 | 0xF990 | 0xF9B0
             | 0xF850 | 0xF810 | 0xF830 | 0xF910 | 0xF930)
-            || (hw0 & 0xFF7F) == 0xF85F // LDR.W literal (either U)
+            || (hw0 & 0xFF7F) == 0xF85F // LDR.W literal, either U
     }
 }
 
@@ -325,7 +325,7 @@ impl CortexM33 {
         } else {
             0xE // AL (always)
         };
-        // LOCAL PATCH (speed): outside an IT block the condition is AL.
+        // Outside an IT block the condition is AL.
         let cond_passed = if in_it { self.regs.condition_passed(cond) } else { true };
         self.last_op_pure = is_pure;
         self.last_op_sleepy = entry.is_sleepy();
@@ -516,7 +516,7 @@ impl CortexM33 {
         if flag_only {
             flags |= DecodedOp::FLAG_FLAG_ONLY;
         }
-        // BKPT (0xBExx) and the hint space (0xBFx0; 0xF3AF wide) can halt
+        // BKPT 0xBExx and the hint space, 0xBFx0 or 0xF3AF wide, can halt
         // or park the core without touching the bus.
         if (!wide && ((hw0 & 0xFF00) == 0xBE00 || (hw0 & 0xFF0F) == 0xBF00)) || (wide && hw0 == 0xF3AF) {
             flags |= DecodedOp::FLAG_SLEEPY;

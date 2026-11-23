@@ -119,9 +119,9 @@ impl Domain {
         }
         self.sys_clks = self.sys_clks.saturating_add(cycles);
         let divisor = self.cycles;
-        // LOCAL PATCH (speed, 2026-11-23): per quantum the accumulator
-        // crosses the divisor at most a few times, so subtract instead of
-        // paying an integer division per domain per quantum. Same result.
+        // Per quantum the accumulator crosses the divisor at most a few
+        // times, so subtract instead of paying an integer division per
+        // domain per quantum. Same result.
         let edges = if self.sys_clks < divisor {
             0
         } else if self.sys_clks < 4 * divisor {
@@ -140,9 +140,8 @@ impl Domain {
         edges
     }
 
-    /// LOCAL PATCH (deadline quanta, 2026-11-23): clk_ref cycles until this
-    /// domain has emitted `n` more edges beyond those already pending, or
-    /// `None` if the divider is stopped.
+    /// clk_ref cycles until this domain has emitted `n` more edges beyond
+    /// those already pending, or `None` if the divider is stopped.
     pub fn ref_cycles_until_edges(&self, n: u64) -> Option<u64> {
         if !self.enable || self.cycles == 0 {
             return None;
@@ -173,7 +172,7 @@ impl Domain {
 /// TICKS register storage — six independent domains.
 pub struct TicksRegs {
     pub domains: [Domain; DOMAIN_COUNT],
-    /// LOCAL PATCH: fractional clk_ref cycles carried between quanta.
+    /// Fractional clk_ref cycles carried between quanta.
     pub ref_frac: u64,
 }
 

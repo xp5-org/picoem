@@ -51,9 +51,9 @@ pub trait CoreBus {
 
     fn set_active_pc(&mut self, pc: u32, core: u8);
 
-    /// LOCAL PATCH (speed): a decode cache just cached the instruction at
-    /// `pc`. Buses that filter self-modifying-code invalidations by page
-    /// override this; the default does nothing.
+    /// A decode cache just cached the instruction at `pc`. Buses that filter
+    /// self-modifying-code invalidations by page override this; the default
+    /// does nothing.
     #[inline(always)]
     fn note_code_fetch(&mut self, _pc: u32) {}
 

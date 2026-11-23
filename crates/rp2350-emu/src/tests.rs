@@ -3424,7 +3424,7 @@ fn enc_vpop(sd: u16, count: u16) -> (u16, u16) {
 
 /// Encode VSEL<cc>.F32 Sd, Sn, Sm (Armv8-M).
 /// cc ∈ {0=EQ, 1=VS, 2=GE, 3=GT}. Prefix 0xFE.
-/// hw0 = 1111 1110 | 0 D cc[1] cc[0] | Vn   (D = hw0[6], cc = hw0[5:4]; matches `fe36 1a01` = vselgt s2,s12,s2)
+/// hw0 = 1111 1110 | 0 D cc[1] cc[0] | Vn, with D = hw0[6] and cc = hw0[5:4]; matches `fe36 1a01` = vselgt s2,s12,s2
 /// hw1 = Vd | 1010 | N 0 M 0 | Vm
 fn enc_vsel(cc: u16, sd: u16, sn: u16, sm: u16) -> (u16, u16) {
     let vd = (sd >> 1) & 0xF;
@@ -4103,20 +4103,58 @@ fn fpu_vsel_gt_all_flag_combos() {
     assert_eq!(c.regs.s[0], 7.0, "N==V==false should select Sn");
 }
 
-#[test]
-fn fpu_vcvta_is_undefined() {
-    // VCVTA.S32.F32 (Armv8-M FP, 0xFE family with hw0[7]=1 and hw0[6:5]!=00)
-    // is not dispatched in Phase 7.1 and must fall through to UNDEFINED,
-    // raising a UsageFault. This test locks in the boundary — if future
-    // dispatch work accidentally routes VCVTA somewhere, this breaks.
+// FPv5 directed rounding. Encodings are from arm-none-eabi-as
+// -mcpu=cortex-m33 -mfpu=fpv5-sp-d16.
+fn fpv5_round(hw0: u16, hw1: u16, sm: usize, val: f32) -> CortexM33 {
     let mut c = CortexM33::for_test(0);
-    c.execute_one_wide(0xFEBD, 0x0A40);
-    assert!(
-        matches!(c.pending_fault, Some(crate::core::Fault::UsageFault)),
-        "VCVTA encoding must fall through to UsageFault (Phase 7.1 boundary); \
-         pending_fault = {:?}",
-        c.pending_fault
-    );
+    c.regs.s[sm] = val;
+    let cy = c.execute_one_wide(hw0, hw1);
+    assert!(c.pending_fault.is_none(), "{hw0:04x} {hw1:04x} faulted: {:?}", c.pending_fault);
+    assert_eq!(cy, 1);
+    c
+}
+
+#[test]
+fn fpu_vrint_anpm_round_per_mnemonic() {
+    // vrinta s0,s1 / vrintn s3,s4 / vrintp s0,s1 / vrintm s0,s1
+    for (v, a, n, p, m) in [(2.5f32, 3.0f32, 2.0f32, 3.0f32, 2.0f32), (-2.5, -3.0, -2.0, -2.0, -3.0),
+                            (1.25, 1.0, 1.0, 2.0, 1.0), (-0.75, -1.0, -1.0, -0.0, -1.0)] {
+        assert_eq!(fpv5_round(0xFEB8, 0x0A60, 1, v).regs.s[0], a, "vrinta {v}");
+        assert_eq!(fpv5_round(0xFEF9, 0x1A42, 4, v).regs.s[3], n, "vrintn {v}");
+        assert_eq!(fpv5_round(0xFEBA, 0x0A60, 1, v).regs.s[0], p, "vrintp {v}");
+        assert_eq!(fpv5_round(0xFEBB, 0x0A60, 1, v).regs.s[0], m, "vrintm {v}");
+    }
+    // vrintp of -0.75 is -0.0: the sign survives.
+    assert!(fpv5_round(0xFEBA, 0x0A60, 1, -0.75).regs.s[0].is_sign_negative());
+    // No IXC: the directed VRINT forms are not "exact" forms.
+    assert_eq!(fpv5_round(0xFEB8, 0x0A60, 1, 2.5).regs.fpscr & FPSCR_IXC, 0);
+}
+
+#[test]
+fn fpu_vcvt_anpm_round_per_mnemonic() {
+    let s32 = |c: CortexM33, r: usize| c.regs.s[r].to_bits() as i32;
+    let u32_ = |c: CortexM33, r: usize| c.regs.s[r].to_bits();
+    // vcvta.s32.f32 s0, s1
+    assert_eq!(s32(fpv5_round(0xFEBC, 0x0AE0, 1, -2.5), 0), -3);
+    assert_eq!(s32(fpv5_round(0xFEBC, 0x0AE0, 1, 2.5), 0), 3);
+    // vcvtn.u32.f32 s0, s0
+    assert_eq!(u32_(fpv5_round(0xFEBD, 0x0A40, 0, 2.5), 0), 2);
+    assert_eq!(u32_(fpv5_round(0xFEBD, 0x0A40, 0, 3.5), 0), 4);
+    assert_eq!(u32_(fpv5_round(0xFEBD, 0x0A40, 0, -1.0), 0), 0, "unsigned saturates at 0");
+    // vcvtp.s32.f32 s2, s3
+    assert_eq!(s32(fpv5_round(0xFEBE, 0x1AE1, 3, -1.5), 2), -1);
+    assert_eq!(s32(fpv5_round(0xFEBE, 0x1AE1, 3, 1.25), 2), 2);
+    assert_eq!(s32(fpv5_round(0xFEBE, 0x1AE1, 3, 3e9), 2), i32::MAX, "saturates");
+    // vcvtm.u32.f32 s0, s1
+    assert_eq!(u32_(fpv5_round(0xFEBF, 0x0A60, 1, 7.99), 0), 7);
+}
+
+#[test]
+fn fpu_vrint_double_precision_is_undefined() {
+    // sz = hw1[8] = 1 would be VRINTA.F64; the SP FPU has no D registers.
+    let mut c = CortexM33::for_test(0);
+    c.execute_one_wide(0xFEB8, 0x0B60);
+    assert!(matches!(c.pending_fault, Some(crate::core::Fault::UsageFault)));
 }
 
 // ----- VMAXNM / VMINNM -----------------------------------------------------
@@ -7064,9 +7102,13 @@ fn ldrex_peer_write_strex_fail() {
         let Cores::Arm(arm) = &mut emu.cores else {
             unreachable!()
         };
+        // The snoop is address-based: a slice starts by giving the
+        // writer the peer's reserved granule.
+        arm[1].peer_reservation = Some(addr);
         arm[1].bus_write32(addr, 0x1234_5678, &mut emu.bus);
     }
     assert!(emu.core_mut(1).did_write_this_quantum);
+    assert!(emu.core_mut(1).peer_reservation_hit);
 
     // Drive one Emulator::step — both cores are at reset-vector PC (fetch
     // whatever is at ROM 0, likely a NOP-like default), but the only
@@ -9165,8 +9207,8 @@ fn decode_cache_wide_boundary_invalidation() {
     };
 
     // Entries injected by hand bypass populate_decode_cache, which is what
-    // records fetched code pages for the SMC filter (LOCAL PATCH speed):
-    // record them the way a real fetch would.
+    // records fetched code pages for the SMC filter: record them the way a
+    // real fetch would.
     bus.note_code_fetch(wide_pc);
     bus.note_code_fetch(wide_pc + 2);
 
@@ -11449,12 +11491,13 @@ mod stage1_execute_coverage {
     // ---- CPS / PRIMASK / FAULTMASK ----
 
     // CPS affect_i branch. ARMv8-M CPS T1 = 1011 0110 011 im 0 I F, so
-    // bit 1 = I (PRIMASK) and bit 0 = F (FAULTMASK). CPSIE I (im=0, I).
+    // bit 1 is I, for PRIMASK, and bit 0 is F, for FAULTMASK. CPSIE I has
+    // im=0 and I set.
     #[test]
     fn cpsie_i_clears_primask() {
         let mut c = CortexM33::for_test(0);
         c.regs.primask = 1;
-        // CPSIE I: bit 4 = 0 (enable → im=0), bit 1 = 1.
+        // CPSIE I: bit 4 = 0, enable → im=0; bit 1 = 1.
         // Base 0xB660 | 0x02 = 0xB662
         c.execute_one(0xB662);
         assert_eq!(c.regs.primask, 0, "CPSIE clears PRIMASK");
@@ -11464,15 +11507,15 @@ mod stage1_execute_coverage {
     fn cpsid_i_sets_primask() {
         let mut c = CortexM33::for_test(0);
         c.regs.primask = 0;
-        // CPSID I: bit 4 = 1 (im=1), bit 1 = 1.
+        // CPSID I: bit 4 = 1, im=1; bit 1 = 1.
         // Base 0xB660 | 0x10 | 0x02 = 0xB672
         c.execute_one(0xB672);
         assert_eq!(c.regs.primask, 1);
     }
 
-    /// Regression: upstream had the I/F bits swapped, so `cpsid i` (the
-    /// most common critical-section opcode, 0xB672) set FAULTMASK and left
-    /// PRIMASK clear — which masked every interrupt except NMI forever.
+    /// `cpsid i`, 0xB672 and the most common critical-section opcode, sets
+    /// PRIMASK and leaves FAULTMASK clear; FAULTMASK would mask every
+    /// interrupt except NMI.
     #[test]
     fn cpsid_i_does_not_touch_faultmask() {
         let mut c = CortexM33::for_test(0);
@@ -15792,8 +15835,8 @@ mod stage2_pwm_coverage {
     fn intr_w1c_via_alias_bitset() {
         let mut p = new_pwm();
         let mut irqs = 0u64;
-        p.write32(0x00, CSR_EN, 0, &mut irqs);
         p.write32(0x10, 1, 0, &mut irqs);
+        p.write32(0x00, CSR_EN, 0, &mut irqs);
         p.write32(EN, 1, 0, &mut irqs);
         p.tick(2, &tree(), &mut irqs);
         assert_eq!(p.read32(INTR) & 1, 1);
@@ -15916,12 +15959,15 @@ mod stage2_pwm_coverage {
         let mut p = new_pwm();
         let mut irqs = 0u64;
         // Slice offsets: CSR=0x00 stride=0x14. TOP=0x10.
-        p.write32(0x00, CSR_EN, 0, &mut irqs); // slice 0 local-enabled
         p.write32(0x10, 100, 0, &mut irqs); // slice 0 TOP = 100
+        p.write32(0x00, CSR_EN, 0, &mut irqs); // slice 0 local-enabled
         p.write32(EN, 1, 0, &mut irqs); // slice 0 globally enabled
-        p.write32(SLICE_STRIDE, CSR_EN, 0, &mut irqs); // slice 1 local
         p.write32(SLICE_STRIDE + 0x10, 100, 0, &mut irqs);
-        // slice 1 NOT globally enabled — `continue` arm.
+        p.write32(SLICE_STRIDE, CSR_EN, 0, &mut irqs); // slice 1 enabled ...
+        // EN aliases CSR_EN, one bit per slice, so writing EN = slice 0
+        // only disables slice 1 again: the `continue` arm.
+        p.write32(EN, 1, 0, &mut irqs);
+        assert_eq!(p.read32(SLICE_STRIDE) & CSR_EN, 0, "EN write cleared slice 1 CSR_EN");
         p.tick(1_000, &tree(), &mut irqs);
         assert!(p.read32(INTR) & (1 << 0) != 0);
         assert!(p.read32(INTR) & (1 << 1) == 0);
@@ -22502,9 +22548,9 @@ mod stage8_workerbus_smoke {
 
     #[test]
     fn wide_misc_cpsie_cpsid() {
-        // ARMv8-M CPS T1: bit 1 = I (PRIMASK), bit 0 = F (FAULTMASK).
+        // ARMv8-M CPS T1: bit 1 = I for PRIMASK, bit 0 = F for FAULTMASK.
         let (mut c, mut bus) = core_and_worker_bus();
-        // CPSID I (im=1, I): 0xB672 = 1011_0110_0111_0010
+        // CPSID I, im=1 and I set: 0xB672 = 1011_0110_0111_0010
         narrow_at(&mut bus, 0x2000_3400, 0xB672);
         c.regs.set_pc(0x2000_3400);
         c.step_no_atomics(&mut bus);
@@ -30544,8 +30590,8 @@ mod stage4_lib_residue_v2 {
         let pre_exec_core0 = emu.cores.expect_arm()[0].counters.decode_execute_cycles;
         let now = emu.step().unwrap();
         // Core 0 is parked → it executes nothing, but its cycle counter
-        // follows the master clock (time passes while asleep; LOCAL PATCH
-        // 2026-11-23, see step_pair_arm).
+        // follows the master clock: time passes while asleep; see
+        // step_pair_arm.
         assert_eq!(emu.cores.expect_arm()[0].counters.decode_execute_cycles, pre_exec_core0);
         assert_eq!(emu.cores.expect_arm()[0].cycles, now);
     }
@@ -30557,6 +30603,35 @@ mod stage4_lib_residue_v2 {
     /// peer-core's exclusive-monitor address and the writer-core's
     /// did_write flag, then step. The post-step cleanup must clear
     /// the peer's monitor.
+    #[test]
+    fn peer_write_elsewhere_keeps_reservation() {
+        // Core1 writing other memory while core0 holds a reservation must not
+        // break core0's STREX, while a core1 write to the reserved word still
+        // does.
+        let mut emu = Emulator::new(Config::default());
+        emu.bus.atomics.set_halted(0);
+        emu.bus.atomics.set_halted(1);
+        {
+            let arm = emu.cores.expect_arm_mut();
+            arm[0].exclusive_address = Some(0x2000_220a & !3);
+            arm[1].peer_reservation = Some(0x2000_2208);
+            arm[1].bus_write32(0x2001_e000, 1, &mut emu.bus);
+            arm[1].bus_write8(0x2000_2200, 1, &mut emu.bus);
+            assert!(!arm[1].peer_reservation_hit);
+        }
+        let _ = emu.step().unwrap();
+        assert_eq!(emu.cores.expect_arm()[0].exclusive_address, Some(0x2000_2208), "unrelated writes keep it");
+        {
+            let arm = emu.cores.expect_arm_mut();
+            arm[1].peer_reservation = Some(0x2000_2208);
+            arm[1].bus_write8(0x2000_220b, 0, &mut emu.bus); // same word, other byte
+        }
+        // step() installs the reservation itself at slice start; emulate the
+        // hit from the write above by running the snoop through step().
+        let hit = emu.cores.expect_arm()[1].peer_reservation_hit;
+        assert!(hit, "a byte inside the reserved word is a hit");
+    }
+
     #[test]
     fn step_pair_arm_exclusive_monitor_snoop_clears_peer() {
         let mut emu = Emulator::new(Config::default());
@@ -30570,6 +30645,9 @@ mod stage4_lib_residue_v2 {
         // → arm both sides.
         emu.cores.expect_arm_mut()[1].exclusive_address = Some(0x2000_0040);
         emu.cores.expect_arm_mut()[0].did_write_this_quantum = true;
+        // Address-based snoop: the flag that clears the peer is a hit on
+        // its reserved granule.
+        emu.cores.expect_arm_mut()[0].peer_reservation_hit = true;
         let _ = emu.step().unwrap();
         // Peer's exclusive monitor cleared.
         assert!(emu.cores.expect_arm()[1].exclusive_address.is_none());
@@ -32783,8 +32861,13 @@ mod stage6_periph_long_tail {
         fn slice_locally_disabled_does_not_advance() {
             let mut p = new_pwm();
             let mut irqs = 0u64;
-            // Globally enable but locally disable (CSR_EN=0 but EN bit set).
+            // EN and CSR_EN are one bit, so "EN set but CSR_EN clear"
+            // cannot exist. Enable through EN, then clear CSR_EN: the
+            // slice is off in both views.
             p.write32(EN, 1, 0, &mut irqs);
+            assert_ne!(p.read32(0x00) & CSR_EN, 0, "EN write set CSR_EN");
+            p.write32(0x00, 0, 0, &mut irqs);
+            assert_eq!(p.read32(EN) & 1, 0, "CSR_EN clear shows in EN");
             p.tick(100, &tree(), &mut irqs);
             // CTR stays 0 because CSR_EN is clear.
             let ctr = p.read32(SLICE_CTR_OFFSET());
@@ -35459,19 +35542,18 @@ fn resets_narrow_writes_widen_to_32_bit() {
     assert_eq!(bus.read32(0x4002_0000, 0), 0xABCD_0000);
 }
 
-/// Regression: encodings emitted by clang for the NE0K FFT (`vselgt.f32 s2, s12, s2` =
-/// 0xFE36 0x1A01). The old decode took D from hw0[4] and cc from hw0[6:5], so this wrote
-/// s3 under VS instead of s2 under GT.
+/// Encodings emitted by clang for the NE0K FFT: `vselgt.f32 s2, s12, s2` = 0xFE36 0x1A01
+/// writes s2 under GT. D comes from hw0[6] and cc from hw0[5:4].
 #[test]
 fn fpu_vselgt_clang_encoding_odd_d_bit_and_cc() {
     let (hw0, hw1) = enc_vsel(3, 2, 12, 2);
     assert_eq!((hw0, hw1), (0xFE36, 0x1A01));
 }
 
-/// LOCAL PATCH (speed, 2026-11-23): stores to SRAM pages that never held
-/// fetched code queue no decode-cache invalidations; stores that touch a
-/// code page (directly, through an atomic alias, or by spilling into it
-/// from the previous page) still do.
+/// Stores to SRAM pages that never held fetched code queue no
+/// decode-cache invalidations. Stores that touch a code page still do,
+/// whether directly, through an atomic alias, or by spilling into it from
+/// the previous page.
 #[test]
 fn smc_invalidation_filtered_by_code_page() {
     let (_core, mut bus) = core_and_bus();
@@ -35486,7 +35568,7 @@ fn smc_invalidation_filtered_by_code_page() {
     assert!(!bus.pending_cache_invalidations.is_empty(), "alias store to a code page must queue");
     bus.pending_cache_invalidations.clear();
     // A halfword store at code-4 affects slots code-6 .. code-3, all in
-    // the (code-free) previous page -> filtered. One at code itself
+    // the code-free previous page -> filtered. One at code itself
     // touches the noted page -> queued.
     bus.write16(code - 4, 4, 0);
     assert!(bus.pending_cache_invalidations.is_empty(), "store wholly in a code-free page queued");

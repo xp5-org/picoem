@@ -662,10 +662,9 @@ impl Ppb {
     /// M33 step path before instruction fetch; the caller then compares
     /// the returned exception's priority against `execution_priority`
     /// to decide whether to preempt.
-    /// LOCAL PATCH (speed, 2026-11-23): cheap gate in front of
-    /// `try_take_any_pending_exception`. False only when that function
-    /// would certainly return `None`: no NMI / PendSV / SysTick pend bit
-    /// in ICSR and no NVIC line both enabled and pending.
+    /// Cheap gate in front of `try_take_any_pending_exception`. False only
+    /// when that function would certainly return `None`: no NMI / PendSV /
+    /// SysTick pend bit in ICSR and no NVIC line both enabled and pending.
     #[inline(always)]
     pub(crate) fn exception_may_be_pending(&self) -> bool {
         (self.icsr & (ICSR_NMIPENDSET | ICSR_PENDSVSET | ICSR_PENDSTSET)) != 0
@@ -710,6 +709,16 @@ impl Ppb {
     /// survive — the dispatch path clears bits on its own (dual-clear
     /// invariant at `exceptions.rs` `try_take_any_pending_exception`).
     pub(crate) fn merge_irq_pending(&mut self, pending: u64) {
+        // A level line still high while its handler is active does not pend
+        // again; the NVIC samples it again at exception return. Every peripheral
+        // here re-asserts its level each tick until the ISR clears the source,
+        // so dropping active lines loses nothing.
+        let active = self.nvic_iabr[0].load(Ordering::Relaxed) as u64
+            | (self.nvic_iabr[1].load(Ordering::Relaxed) as u64) << 32;
+        let pending = pending & !active;
+        if pending == 0 {
+            return;
+        }
         self.nvic_ispr[0].fetch_or(pending as u32, Ordering::Relaxed);
         self.nvic_ispr[1].fetch_or((pending >> 32) as u32, Ordering::Relaxed);
     }
@@ -1220,6 +1229,20 @@ mod tests {
         // Writes are silent no-ops — exercising the catch-all match arm.
         ppb.write32(0xE000_E120, 0xFFFF_FFFF);
         assert_eq!(ppb.read32(0xE000_E120), 0);
+    }
+
+    #[test]
+    fn merge_skips_lines_whose_irq_is_active() {
+        // A level line seen while its handler is active must not pend again;
+        // after exception return it does.
+        let mut ppb = Ppb::default();
+        ppb.set_irq_active(11);
+        ppb.merge_irq_pending((1u64 << 11) | (1u64 << 40));
+        assert_eq!(ppb.nvic_ispr[0].load(Ordering::Relaxed) & (1u32 << 11), 0, "active line not re-pended");
+        assert_ne!(ppb.nvic_ispr[1].load(Ordering::Relaxed) & (1u32 << 8), 0, "other lines still pend");
+        ppb.clear_active(16 + 11);
+        ppb.merge_irq_pending(1u64 << 11);
+        assert_ne!(ppb.nvic_ispr[0].load(Ordering::Relaxed) & (1u32 << 11), 0, "pends again once inactive");
     }
 
     #[test]

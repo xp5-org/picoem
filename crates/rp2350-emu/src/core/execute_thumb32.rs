@@ -707,11 +707,11 @@ impl CortexM33 {
                     if i == 15 {
                         if Self::is_exc_return(val) {
                             bus.set_burst_mode(false);
-                            // Base-register writeback must land BEFORE the
-                            // exception return unstacks (e.g. `ldmia sp!,
-                            // {..., pc}` / `pop {..., pc}` with EXC_RETURN in
-                            // the pc slot). Upstream returned first, so the
-                            // frame was unstacked from a stale SP.
+                            // Base-register writeback must land before the
+                            // exception return unstacks, for example `ldmia
+                            // sp!, {..., pc}` / `pop {..., pc}` with EXC_RETURN
+                            // in the pc slot; otherwise the frame is unstacked
+                            // from a stale SP.
                             if w && reglist & (1 << rn) == 0 {
                                 self.regs.r[rn] = match op {
                                     0b01 => self.regs.r[rn].wrapping_add(count * 4),
@@ -887,9 +887,9 @@ impl CortexM33 {
             self.exclusive_address = None;
             return 2;
         }
-        // LOCAL PATCH (AD9850 probe): ARMv8-M acquire/release family, which
-        // pico-sdk 2.x uses (hw_claim_*, spin locks). Ordering is irrelevant
-        // for this single-bus emulator, so these map to plain/exclusive ops.
+        // ARMv8-M acquire/release family, used by pico-sdk 2.x in hw_claim_* and
+        // the spin locks. Ordering is irrelevant for this single-bus emulator, so
+        // these map to plain and exclusive ops.
         //   LDAEXB/H/LDAEX: E8D n | Rt F {C,D,E} F
         //   STLEXB/H/STLEX: E8C n | Rt F {C,D,E} Rd
         //   LDAB/H/LDA:     E8D n | Rt F {8,9,A} F

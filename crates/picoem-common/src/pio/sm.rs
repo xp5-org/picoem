@@ -456,12 +456,12 @@ impl StateMachine {
         }
     }
 
-    /// LOCAL PATCH (AD9850 probe, 2026-11-23): pure form of
-    /// [`Self::check_stall`] for the bulk-advance fast path. True when the
-    /// SM is stalled, has no delay or forced instruction queued, and its
-    /// stall condition holds for the given (unchanging) IRQ flags and GPIO
-    /// sample. Does not auto-clear IRQ flags: a `WaitIrq` that would match
-    /// returns false, so the caller takes the per-cycle path.
+    /// Pure form of [`Self::check_stall`] for the bulk-advance fast path.
+    /// True when the SM is stalled, has no delay or forced instruction
+    /// queued, and its stall condition holds for the given IRQ flags and
+    /// GPIO sample, which stay fixed for the call. Does not auto-clear IRQ
+    /// flags: a `WaitIrq` that would match returns false, so the caller
+    /// takes the per-cycle path.
     pub(crate) fn quiescent(&self, irq_flags: u8, gpio_in: u32) -> bool {
         if !self.stalled || self.delay_count != 0 || self.pending_exec.is_some() {
             return false;
@@ -481,11 +481,10 @@ impl StateMachine {
         }
     }
 
-    /// LOCAL PATCH (AD9850 probe, 2026-11-23): advance a quiescent SM by
-    /// `n` system clocks at once. Same end state as `n` calls of
-    /// `clock_tick` + `execute_cycle` while the stall holds: the clock
-    /// divider accumulator moves on, and every PIO clock it yields counts
-    /// as a stall cycle. Returns false (and changes nothing) if the
+    /// Advances a quiescent SM by `n` system clocks at once. Same end state
+    /// as `n` calls of `clock_tick` + `execute_cycle` while the stall holds:
+    /// the clock divider accumulator moves on, and every PIO clock it yields
+    /// counts as a stall cycle. Returns false and changes nothing if the
     /// accumulator is out of range, so the caller falls back to stepping.
     pub(crate) fn bulk_stall(&mut self, n: u32) -> bool {
         if !self.enabled {

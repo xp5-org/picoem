@@ -841,8 +841,8 @@ impl Emulator {
         if self.execution_model == ExecutionModel::Serial {
             let target = self.clock.cycles + cycles;
             while self.clock.cycles < target {
-                // LOCAL PATCH (deadline quanta): end the quantum on the exact
-                // cycle the next TIMER alarm matches (see Bus::deadline_quanta).
+                // End the quantum on the exact cycle the next TIMER alarm
+                // matches; see Bus::deadline_quanta.
                 if self.bus.deadline_quanta && self.step_quantum > 1 {
                     if let Some(n) = self.bus.sys_cycles_to_next_timer_alarm() {
                         let full = self.step_quantum;
@@ -1163,11 +1163,10 @@ impl Emulator {
                     {
                         self.bus.atomics.clear_wfe_waiting(i);
                     }
-                    // LOCAL PATCH (AD9850 probe): ARMv8-M also wakes WFE on a
-                    // pending+enabled exception (interrupt entry). Upstream only
-                    // wakes on the event flag, so alarm-IRQ based sleep_ms()
-                    // never returns. Check both the raw atomic mask and the
-                    // already-merged NVIC pending state.
+                    // ARMv8-M also wakes WFE on a pending and enabled
+                    // exception, not only on the event flag; the SDK's
+                    // alarm-based sleep_ms relies on it. Check both the raw
+                    // atomic mask and the already-merged NVIC pending state.
                     if self.bus.atomics.is_wfe_waiting(i) {
                         let pending = self.bus.atomics.irq_pending_load(i);
                         if (pending != 0 && arm[i].ppb.any_pending_enabled(pending))
@@ -1217,6 +1216,24 @@ impl Emulator {
             let (pio_oe_lo, pio_oe_hi) = pio.local_to_physical_pins(pio.pad_oe);
             out_lo = (out_lo & !pio_oe_lo) | (pio_out_lo & pio_oe_lo);
             out_hi = (out_hi & !pio_oe_hi) | (pio_out_hi & pio_oe_hi);
+        }
+        // A pin whose FUNCSEL is PWM shows its PWM channel.
+        // GPIO0..31 -> slice (n/2)%8, GPIO32..47 -> slice 8 + (n/2)%4;
+        // even pins are channel A, odd pins channel B.
+        let pwm_pins = self.bus.io_bank0.pwm_pins();
+        if pwm_pins != 0 {
+            let mut levels = 0u64;
+            let mut rem = pwm_pins;
+            while rem != 0 {
+                let n = rem.trailing_zeros();
+                rem &= rem - 1;
+                let slice = if n < 32 { (n as usize >> 1) & 7 } else { 8 + ((n as usize >> 1) & 3) };
+                if self.bus.pwm.channel_level(slice, n & 1 == 1) {
+                    levels |= 1u64 << n;
+                }
+            }
+            out_lo = (out_lo & !(pwm_pins as u32)) | (levels as u32);
+            out_hi = (out_hi & !((pwm_pins >> 32) as u32)) | ((levels >> 32) as u32);
         }
         let ext_mask = self.bus.gpio_external_mask;
         let ext_val = self.bus.gpio_external_in.load(Ordering::Relaxed);
@@ -1451,14 +1468,16 @@ fn step_pair_arm(cs: &mut [CortexM33; 2], bus: &mut Bus, target: u64) {
             cs[core_id].ppb.merge_irq_pending(pending);
         }
 
-        // LOCAL PATCH (speed, 2026-11-23): the slice start merged pending
-        // IRQs above; the core re-polls only after its own bus accesses.
-        // Pure ops cannot sleep, write memory or assert IRQs, so the sleep
-        // re-check and invalidation drains below run only when
-        // step_serial says the op may have done one of those. The DWT
-        // cycle snapshot is refreshed on PPB access inside step_serial.
+        // The slice start merged pending IRQs above; the core re-polls
+        // only after its own bus accesses. Pure ops cannot sleep, write
+        // memory or assert IRQs, so the sleep re-check and invalidation
+        // drains below run only when step_serial says the op may have
+        // done one of those. The DWT cycle snapshot is refreshed on PPB
+        // access inside step_serial.
         cs[core_id].irq_check_due = false;
         cs[core_id].idle_slice_start();
+        // The hit flag is cleared at the end of each slice, below.
+        cs[core_id].peer_reservation = cs[1 - core_id].exclusive_address.map(|a| a & !3);
         let mut asleep = cs[core_id].is_halted() || cs[core_id].is_wfe_waiting();
         while !asleep && cs[core_id].cycles < target {
             let pc0 = cs[core_id].regs.pc();
@@ -1496,14 +1515,12 @@ fn step_pair_arm(cs: &mut [CortexM33; 2], bus: &mut Bus, target: u64) {
                 bus.pending_invalidation_regions = 0;
             }
         }
-        // LOCAL PATCH (AD9850 probe, 2026-11-23): time passes while a core
-        // sleeps. A halted (WFI / not yet launched) or WFE-waiting core
-        // used to keep its `cycles` frozen; on wake it then sat behind
-        // the master clock and ran a catch-up burst of instructions in
-        // zero emulated time with peripherals frozen (core1 launched at
-        // 2 s ran 2 s of code in its first quantum). Pull the sleeper up
-        // to the quantum target so it resumes in step with the clock and
-        // its SysTick keeps counting through the sleep.
+        // Time passes while a core sleeps. A core that is halted, in WFI
+        // or not yet launched, or waiting in WFE is pulled up to the
+        // quantum target, so it resumes in step with the clock and its
+        // SysTick keeps counting through the sleep. A frozen `cycles`
+        // would make it run a catch-up burst of instructions in zero
+        // emulated time after it wakes.
         if cs[core_id].cycles < target && (cs[core_id].is_halted() || cs[core_id].is_wfe_waiting()) {
             cs[core_id].cycles = target;
         }
@@ -1520,11 +1537,15 @@ fn step_pair_arm(cs: &mut [CortexM33; 2], bus: &mut Bus, target: u64) {
         // quantum. Correct under the serial-interleave scheduler
         // because cores run sequentially within a quantum; threaded
         // mode (Phase 1+) will require atomic CAS on SharedMemory.
+        // Only a write to the peer's reserved granule invalidates it;
+        // see `CortexM33::peer_reservation`.
         let peer = 1 - core_id;
-        if cs[peer].exclusive_address.is_some() && cs[core_id].did_write_this_quantum {
+        if cs[peer].exclusive_address.is_some() && cs[core_id].peer_reservation_hit {
             cs[peer].exclusive_address = None;
         }
         cs[core_id].did_write_this_quantum = false;
+        cs[core_id].peer_reservation = None;
+        cs[core_id].peer_reservation_hit = false;
     }
 }
 
@@ -2774,16 +2795,15 @@ mod stage8_lib_residue {
         let pre = emu.cores.expect_arm()[1].counters.decode_execute_cycles;
         let now = emu.step().unwrap();
         // Parked core executes nothing, but time passes: its cycle count
-        // follows the master clock (LOCAL PATCH 2026-11-23, see step_pair_arm).
+        // follows the master clock; see step_pair_arm.
         assert_eq!(emu.cores.expect_arm()[1].counters.decode_execute_cycles, pre);
         assert_eq!(emu.cores.expect_arm()[1].cycles, now);
     }
 
-    /// LOCAL PATCH 2026-11-23 regression: a core that wakes after a long
-    /// halt resumes in step with the master clock instead of running a
-    /// catch-up burst of every cycle it slept through (which happened in
-    /// zero emulated time with peripherals frozen). Zeroed memory decodes
-    /// as `movs r0, r0`, so the woken core has something to execute.
+    /// A core that wakes after a long halt resumes in step with the master
+    /// clock instead of running a catch-up burst of every cycle it slept
+    /// through. Zeroed memory decodes as `movs r0, r0`, so the woken core has
+    /// something to execute.
     #[test]
     fn woken_core_does_not_run_catch_up_burst() {
         let mut emu = Emulator::new(Config::default());
@@ -2798,14 +2818,63 @@ mod stage8_lib_residue {
         let before = emu.cores.expect_arm()[1].counters.decode_execute_cycles;
         emu.step().unwrap();
         let ran = emu.cores.expect_arm()[1].counters.decode_execute_cycles - before;
-        // One quantum of work (plus at most one instruction's overshoot),
+        // One quantum of work plus at most one instruction's overshoot,
         // not the 10 quanta it slept through.
         assert!(ran >= 1 && ran < 2 * q, "woken core executed {ran} cycles in one {q}-cycle quantum");
     }
 
-    /// LOCAL PATCH 2026-11-23: with `deadline_quanta`, a TIMER0 alarm
-    /// becomes pending on the same master cycle whatever the step quantum
-    /// is (and that cycle matches quantum 1, the exact reference).
+    /// With `deadline_quanta`, a TIMER0 alarm becomes pending on the same
+    /// master cycle whatever the step quantum is, and that cycle matches
+    /// quantum 1, the exact reference.
+    #[test]
+    fn pwm_drives_funcsel_pin_and_paces_dma_per_wrap() {
+        // PWM slice 6 channel A on GPIO28 with FUNCSEL 4, period 10, and a DMA
+        // channel paced on DREQ_PWM_WRAP6 that feeds CC one sample per wrap.
+        // Checks the pin level per cycle, that every wrap moves exactly one
+        // sample even when one quantum spans several wraps, and that CC is
+        // double-buffered: a DMA write lands at the next wrap.
+        let samples: [u16; 4] = [3, 7, 1, 9];
+        let run = |q: u32| -> (Vec<u32>, u32) {
+            let mut emu = Emulator::new(Config::default());
+            emu.bus.atomics.set_halted(0);
+            emu.bus.atomics.set_halted(1);
+            emu.step_quantum = q;
+            emu.mmio_write32(0x4002_3000, (1 << crate::bus::RESET_PWM) | (1 << crate::bus::RESET_DMA) | (1 << crate::bus::RESET_IO_BANK0));
+            for (k, v) in samples.iter().enumerate() {
+                emu.mmio_write32(0x2000_1000 + 4 * k as u32, *v as u32);
+            }
+            emu.mmio_write32(0x4002_8000 + 28 * 8 + 4, 4); // GPIO28_CTRL FUNCSEL = PWM
+            let slice = 0x400A_8000 + 6 * 0x14;
+            emu.mmio_write32(slice + 0x10, 9); // TOP: period 10
+            emu.mmio_write32(slice + 0x0C, 5); // CC A = 5 for the first period
+            emu.mmio_write32(slice, 1); // CSR_EN
+            // DMA ch0: 32-bit reads from the sample table into CC, 4 transfers.
+            emu.mmio_write32(0x5000_0000, 0x2000_1000);
+            emu.mmio_write32(0x5000_0004, slice + 0x0C);
+            emu.mmio_write32(0x5000_0008, 4);
+            emu.mmio_write32(0x5000_000C, 1 | (2 << 2) | (1 << 4) | (38 << 17)); // EN, word, INCR_READ, TREQ PWM_WRAP6
+            let mut highs = Vec::new();
+            let mut cur = 0;
+            let mut c0 = emu.cycles();
+            while emu.cycles() < 60 {
+                emu.run(1).unwrap();
+                if q == 1 {
+                    if emu.gpio_read(28) { cur += 1; }
+                    if emu.cycles() - c0 == 10 { highs.push(cur); cur = 0; c0 = emu.cycles(); }
+                }
+            }
+            (highs, emu.mmio_read32(0x5000_0008))
+        };
+        let (highs, left) = run(1);
+        // Period 1 uses CC=5; the DMA writes 3 just after the first wrap,
+        // which takes effect at the second wrap, and so on.
+        assert_eq!(&highs[..5], &[5, 5, 3, 7, 1], "high cycles per PWM period");
+        assert_eq!(left, 0, "4 wraps -> 4 transfers");
+        // One quantum covering all the wraps moves the same number of samples.
+        let (_, left_q64) = run(64);
+        assert_eq!(left_q64, 0);
+    }
+
     #[test]
     fn deadline_quanta_alarm_cycle_independent_of_quantum() {
         let fire_cycle = |q: u32, deadline: bool| -> u64 {
@@ -2814,16 +2883,16 @@ mod stage8_lib_residue {
             emu.bus.atomics.set_halted(1);
             emu.bus.deadline_quanta = deadline;
             emu.step_quantum = q;
-            // Release TIMER0 from reset and start its 1 us TICKS domain
-            // (what firmware / the bootrom normally do).
+            // Release TIMER0 from reset and start its 1 us TICKS domain,
+            // as firmware or the bootrom normally does.
             emu.mmio_write32(0x4002_3000, 1 << crate::bus::RESET_TIMER0);
             emu.bus.ticks.domains[crate::peripherals::ticks::DOMAIN_TIMER0].enable = true;
-            // TIMER0: INTE alarm0, ALARM0 = now + 37 us (arms it).
+            // TIMER0: INTE alarm0, ALARM0 = now + 37 us, which arms it.
             emu.mmio_write32(0x400B_0040, 1);
             let now = emu.mmio_read32(0x400B_0028);
             emu.mmio_write32(0x400B_0010, now.wrapping_add(37));
             loop {
-                emu.run(1).unwrap(); // one (deadline-adjusted) quantum
+                emu.run(1).unwrap(); // one deadline-adjusted quantum
                 if emu.bus.atomics.irq_pending_load(0) & 1 != 0 {
                     return emu.cycles();
                 }
@@ -2834,7 +2903,7 @@ mod stage8_lib_residue {
         for q in [64u32, 256, 1000, 4096] {
             assert_eq!(fire_cycle(q, true), exact, "quantum {q} with deadline quanta");
         }
-        // Without it, a large quantum fires late (sanity check of the test).
+        // Without it, a large quantum fires late; this checks the test itself.
         assert!(fire_cycle(4096, false) > exact);
     }
 

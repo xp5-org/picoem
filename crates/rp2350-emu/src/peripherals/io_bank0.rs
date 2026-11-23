@@ -77,9 +77,22 @@ pub struct IoBank0Regs {
     proc1_intf: [u32; INT_GROUP_COUNT],
     dormant_wake_inte: [u32; INT_GROUP_COUNT],
     dormant_wake_intf: [u32; INT_GROUP_COUNT],
+    /// Pins whose FUNCSEL selects PWM, bit n = GPIOn, kept up to date on CTRL
+    /// writes so `Emulator::update_gpio` can route PWM outputs without
+    /// scanning 48 CTRL words every quantum.
+    pwm_pins: u64,
 }
 
+/// FUNCSEL value that routes a pin to its PWM channel, F4 on RP2350.
+pub const FUNCSEL_PWM: u32 = 4;
+
 impl IoBank0Regs {
+    /// Pins whose FUNCSEL is PWM; bit n = GPIOn.
+    #[inline]
+    pub fn pwm_pins(&self) -> u64 {
+        self.pwm_pins
+    }
+
     pub fn new() -> Self {
         Self {
             ctrl: [0; GPIO_COUNT],
@@ -90,6 +103,7 @@ impl IoBank0Regs {
             proc1_intf: [0; INT_GROUP_COUNT],
             dormant_wake_inte: [0; INT_GROUP_COUNT],
             dormant_wake_intf: [0; INT_GROUP_COUNT],
+            pwm_pins: 0,
         }
     }
 
@@ -181,6 +195,11 @@ impl IoBank0Regs {
                     let mut stored = self.ctrl[gpio];
                     apply_alias_rmw(&mut stored, value, alias);
                     self.ctrl[gpio] = stored;
+                    if stored & 0x1F == FUNCSEL_PWM {
+                        self.pwm_pins |= 1u64 << gpio;
+                    } else {
+                        self.pwm_pins &= !(1u64 << gpio);
+                    }
                 }
                 _ => {}
             }

@@ -208,7 +208,7 @@ pub(crate) enum Fault {
 #[derive(Debug, Default, Clone)]
 pub struct CoreCounters {
     pub decode_execute_cycles: u64,
-    /// LOCAL PATCH: instructions retired through `step_serial`.
+    /// Instructions retired through `step_serial`.
     pub instructions: u64,
     pub wfi_cycles: u64,
     pub wfe_cycles: u64,
@@ -217,8 +217,8 @@ pub struct CoreCounters {
     pub sio_accesses: u64,
     pub peripheral_accesses: u64,
     pub ppb_accesses: u64,
-    /// LOCAL PATCH (speed): cycles the idle-loop skip advanced without
-    /// executing (already included in `decode_execute_cycles`). Diagnostic.
+    /// Cycles the idle-loop skip advanced without executing, already included
+    /// in `decode_execute_cycles`. Diagnostic.
     pub idle_skipped_cycles: u64,
 }
 
@@ -244,9 +244,9 @@ impl CoreCounters {
     }
 }
 
-/// LOCAL PATCH (speed, 2026-11-23): architectural state the idle-loop
-/// detector compares between two visits to a loop head, plus the cycle
-/// and counter values to scale when iterations are skipped.
+/// Architectural state the idle-loop detector compares between two visits
+/// to a loop head, plus the cycle and counter values to scale when
+/// iterations are skipped.
 pub struct IdleSnap {
     pub(crate) pc: u32,
     pub(crate) regs: Registers,
@@ -259,8 +259,8 @@ pub struct IdleSnap {
     pub(crate) counters: CoreCounters,
 }
 
-/// Bitwise equality of two register files (S registers by bit pattern so
-/// NaNs compare equal to themselves).
+/// Bitwise equality of two register files. S registers compare by bit
+/// pattern, so a NaN equals itself.
 fn regs_identical(a: &Registers, b: &Registers) -> bool {
     a.r == b.r
         && a.xpsr == b.xpsr
@@ -284,21 +284,21 @@ fn regs_identical(a: &Registers, b: &Registers) -> bool {
         && a.s.iter().zip(b.s.iter()).all(|(x, y)| x.to_bits() == y.to_bits())
 }
 
-/// LOCAL PATCH (speed, 2026-11-23): reads the idle-loop detector treats as
-/// side-effect-free AND constant for the rest of a core's slice in the
-/// Serial scheduler (no other agent runs mid-slice; peripherals and pins
-/// only move at the quantum end): ROM, XIP flash / XIP SRAM, main SRAM,
-/// the TIMER0/1 raw counters, SIO CPUID / GPIO_IN / GPIO_HI_IN. Everything
-/// else (PPB, SIO FIFO / spinlocks / DIV, peripheral FIFOs, latching
-/// registers like TIMELR) counts as a side effect.
+/// Reads the idle-loop detector treats as side-effect-free and constant
+/// for the rest of a core's slice in the Serial scheduler, where no other
+/// agent runs mid-slice and peripherals and pins only move at the quantum
+/// end: ROM, XIP flash / XIP SRAM, main SRAM, the TIMER0/1 raw counters,
+/// SIO CPUID / GPIO_IN / GPIO_HI_IN. Everything else counts as a side
+/// effect: PPB, SIO FIFO / spinlocks / DIV, peripheral FIFOs, and latching
+/// registers such as TIMELR.
 #[inline(always)]
 pub(crate) fn idle_clean_read(addr: u32) -> bool {
     use crate::peripherals::timer::{TIMER0_BASE, TIMER1_BASE, TIMERAWH_OFFSET, TIMERAWL_OFFSET};
     match addr >> 28 {
         0x0 | 0x1 | 0x2 => true,
         0x4 => {
-            // TIMER0 0x400B_0000 / TIMER1 0x400B_8000 (32 KB apart; atomic
-            // alias bits 12-13 fold into the same register).
+            // TIMER0 0x400B_0000 / TIMER1 0x400B_8000 are 32 KB apart; atomic
+            // alias bits 12-13 fold into the same register.
             let base = addr & 0xFFFF_8000;
             let off = addr & 0xFFF;
             (base == TIMER0_BASE || base == TIMER1_BASE) && (off == TIMERAWL_OFFSET || off == TIMERAWH_OFFSET)
@@ -322,26 +322,26 @@ pub struct CortexM33 {
     /// Address of the currently executing instruction. Used to compute
     /// "read PC" value (instr_addr + 4) per ARM architecture definition.
     current_instr_addr: u32,
-    /// LOCAL PATCH (speed): set by `decode_execute`: the op just run was
-    /// classified pure (no bus access, no synchronous fault).
+    /// Set by `decode_execute`: the op just run was classified pure, with no
+    /// bus access and no synchronous fault.
     pub(crate) last_op_pure: bool,
-    /// LOCAL PATCH (speed): the op just run was BKPT / a hint.
+    /// The op just run was BKPT or a hint.
     pub(crate) last_op_sleepy: bool,
-    /// LOCAL PATCH (speed): the op just run was a plain load encoding.
+    /// The op just run was a plain load encoding.
     pub(crate) last_op_idle_load: bool,
-    /// LOCAL PATCH (speed): idle-loop detector. Set when the current loop
-    /// iteration did anything that could make iterations differ or have
-    /// effects (store, side-effecting read, exception, hint, coprocessor).
+    /// Idle-loop detector: set when the current loop iteration did anything
+    /// that could make iterations differ or have effects: a store, a
+    /// side-effecting read, an exception, a hint or a coprocessor op.
     pub(crate) idle_dirty: bool,
     /// Idle-loop detector snapshot at the last loop-head visit.
     pub(crate) idle_snap: Option<Box<IdleSnap>>,
-    /// Failed snapshot compares this slice (detector backs off after a few).
+    /// Failed snapshot compares this slice; the detector backs off after a few.
     pub(crate) idle_fails: u8,
-    /// LOCAL PATCH (speed): enable the exact idle-loop skip in the Serial
-    /// scheduler (default on). Off = execute every iteration (A/B check).
+    /// Enables the exact idle-loop skip in the Serial scheduler, default on.
+    /// Off executes every iteration, for A/B checks.
     pub idle_skip: bool,
-    /// LOCAL PATCH (speed): the previous instruction could have asserted
-    /// an IRQ (bus access, exception entry); poll `irq_pending` next.
+    /// The previous instruction could have asserted an IRQ through a bus
+    /// access or exception entry; poll `irq_pending` next.
     pub(crate) irq_check_due: bool,
     /// IT block state. Format: cond[7:4]:mask[3:0]. mask=0 means not in IT block.
     pub(crate) it_state: u8,
@@ -394,6 +394,13 @@ pub struct CortexM33 {
     /// writes do NOT invalidate the local monitor (per ARM semantics).
     /// Phase 0b.2 of the Threaded Dual-Core Emulation plan.
     pub(crate) did_write_this_quantum: bool,
+    /// The peer core's reserved granule, one word, for this slice.
+    /// `step_pair_arm` installs it before the slice runs; the peer cannot
+    /// change it while this core runs. Only a write to that granule clears
+    /// the peer's reservation, as the global monitor does on silicon.
+    pub(crate) peer_reservation: Option<u32>,
+    /// Set by the write wrappers when a write hit `peer_reservation`.
+    pub(crate) peer_reservation_hit: bool,
     /// Per-core SIO state — DIV and INTERP register files. Phase 3
     /// Stage 3 (LLD V7 §6): moved off `Sio` because each core sees
     /// its own divider and interpolator state. DIV/INTERP MMIO
@@ -485,6 +492,8 @@ impl CortexM33 {
             ppb: Ppb::default(),
             exclusive_address: None,
             did_write_this_quantum: false,
+            peer_reservation: None,
+            peer_reservation_hit: false,
             sio_local: PerCoreSio::default(),
             decode_cache,
             counters: CoreCounters::default(),
@@ -603,20 +612,20 @@ impl CortexM33 {
         self.cycles = self.cycles.wrapping_add(cycles as u64);
     }
 
-    /// LOCAL PATCH (speed, 2026-11-23): Serial-scheduler step. Same
-    /// semantics as [`Self::step`] for a core the caller has already
-    /// checked is neither halted nor WFE-waiting (`step_pair_arm` does),
-    /// minus per-instruction work that cannot change the outcome:
+    /// Serial-scheduler step. Same semantics as [`Self::step`] for a core the
+    /// caller has already checked is neither halted nor WFE-waiting, as
+    /// `step_pair_arm` does, minus per-instruction work that cannot change
+    /// the outcome:
     ///   - no repeat of the halted / WFE atomic loads;
     ///   - exception arbitration only when `exception_may_be_pending`;
-    ///   - no bus-fault poll after a pure op (pure = no bus access);
+    ///   - no bus-fault poll after a pure op, one with no bus access;
     ///   - DWT's cycle snapshot is refreshed on PPB access instead of
-    ///     before every instruction (see `bus_read*` / `bus_write*`).
+    ///     before every instruction; see `bus_read*` / `bus_write*`.
     #[inline(always)]
     pub(crate) fn step_serial<B: CoreBus>(&mut self, bus: &mut B) -> bool {
         let core = self.core_id as usize;
-        // Only a bus access (or exception entry) by this core can assert an
-        // IRQ while it runs its slice; the slice start merges the rest.
+        // Only a bus access or exception entry by this core can assert an IRQ
+        // while it runs its slice; the slice start merges the rest.
         if self.irq_check_due {
             self.irq_check_due = false;
             let pending = self.atomics.take_irq_pending(core);
@@ -686,16 +695,16 @@ impl CortexM33 {
         check
     }
 
-    /// LOCAL PATCH (speed, 2026-11-23): idle-loop skip for the Serial
-    /// scheduler. Called when the core has just branched backwards to `pc`
-    /// (a loop head). If the iteration that just ended was clean (only
-    /// side-effect-free, slice-constant reads; no stores, exceptions,
-    /// hints or coprocessor ops) and the architectural state equals the
-    /// state at the previous visit, every further iteration in this slice
-    /// is identical: nothing else can change what it reads until the
-    /// quantum ends. Skip as many whole iterations as fit before `target`,
-    /// advancing `cycles` and the counters exactly as executing them would.
-    /// The remainder runs normally, so the result is bit-identical.
+    /// Idle-loop skip for the Serial scheduler, called when the core has just
+    /// branched backwards to `pc`, a loop head. An iteration is clean when it
+    /// did only side-effect-free, slice-constant reads and no stores,
+    /// exceptions, hints or coprocessor ops. If the iteration that just ended
+    /// was clean and the architectural state equals the state at the previous
+    /// visit, every further iteration in this slice is identical: nothing else
+    /// can change what it reads until the quantum ends. Skip as many whole
+    /// iterations as fit before `target`, advancing `cycles` and the counters
+    /// exactly as executing them would. The remainder runs normally, so the
+    /// result is bit-identical.
     pub(crate) fn idle_head_visit(&mut self, pc: u32, target: u64) {
         let clean = !self.idle_dirty;
         self.idle_dirty = false;
@@ -741,7 +750,7 @@ impl CortexM33 {
                         self.counters.idle_skipped_cycles += iter * k;
                     }
                 }
-                // Keep the snapshot (state is unchanged), re-based on now.
+                // The state is unchanged: keep the snapshot, re-based on now.
                 let s = self.idle_snap.as_deref_mut().unwrap();
                 s.cycles = self.cycles;
                 s.counters = self.counters.clone();
@@ -1080,7 +1089,7 @@ impl CortexM33 {
             self.idle_dirty = true;
         }
         if addr >> 28 == 0xE && !Bus::is_boot_ram(addr) {
-            self.ppb.update_latest_cycles(self.cycles); // DWT CYCCNT snapshot (LOCAL PATCH speed)
+            self.ppb.update_latest_cycles(self.cycles); // DWT CYCCNT snapshot
             let val = self.ppb.read32(addr);
             if bus.mmio_trace_enabled() {
                 bus.emit_mmio_trace('R', 4, addr, val, self.core_id);
@@ -1103,8 +1112,11 @@ impl CortexM33 {
         // exclusive monitor. `Emulator::step` snoops this flag after the
         // core's quantum slice and clears the peer's `exclusive_address`.
         self.did_write_this_quantum = true;
+        if self.peer_reservation == Some(addr & !3) {
+            self.peer_reservation_hit = true;
+        }
         if addr >> 28 == 0xE && !Bus::is_boot_ram(addr) {
-            self.ppb.update_latest_cycles(self.cycles); // DWT CYCCNT snapshot (LOCAL PATCH speed)
+            self.ppb.update_latest_cycles(self.cycles); // DWT CYCCNT snapshot
             self.ppb.write32(addr, val);
             self.sync_nvic_to_irq_pending(addr, bus);
             if bus.mmio_trace_enabled() {
@@ -1132,7 +1144,7 @@ impl CortexM33 {
             // firmware sees plausible data. Contrast bus_read8, which
             // returns 0 — byte access is more unusual and worth flagging
             // via a telltale zero.
-            self.ppb.update_latest_cycles(self.cycles); // DWT CYCCNT snapshot (LOCAL PATCH speed)
+            self.ppb.update_latest_cycles(self.cycles); // DWT CYCCNT snapshot
             let word = self.ppb.read32(addr & !3);
             let val = if addr & 2 != 0 {
                 (word >> 16) as u16
@@ -1165,12 +1177,15 @@ impl CortexM33 {
         self.counters.classify_access(addr, true);
         // Phase 0b.2: see `bus_write32` for the monitor-invalidation rationale.
         self.did_write_this_quantum = true;
+        if self.peer_reservation == Some(addr & !3) {
+            self.peer_reservation_hit = true;
+        }
         if addr >> 28 == 0xE && !Bus::is_boot_ram(addr) {
             // ARMv8-M: halfword PPB accesses are UNPREDICTABLE. We
             // defensively RMW the matching half of the containing 32-bit
             // register rather than faulting. Contrast bus_write8, which
             // drops the write — byte writes to PPB are more unusual.
-            self.ppb.update_latest_cycles(self.cycles); // DWT CYCCNT snapshot (LOCAL PATCH speed)
+            self.ppb.update_latest_cycles(self.cycles); // DWT CYCCNT snapshot
             let old = self.ppb.read32(addr & !3);
             let new_val = if addr & 2 != 0 {
                 (old & 0x0000_FFFF) | ((val as u32) << 16)
@@ -1225,6 +1240,9 @@ impl CortexM33 {
         self.counters.classify_access(addr, true);
         // Phase 0b.2: see `bus_write32` for the monitor-invalidation rationale.
         self.did_write_this_quantum = true;
+        if self.peer_reservation == Some(addr & !3) {
+            self.peer_reservation_hit = true;
+        }
         if addr >> 28 == 0xE && !Bus::is_boot_ram(addr) {
             // PPB registers are word-access-only; byte writes drop.
             if bus.mmio_trace_enabled() {
