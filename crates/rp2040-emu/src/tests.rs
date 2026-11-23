@@ -5029,7 +5029,7 @@ mod stage2_bus_coverage {
         assert_eq!(bus.read16(XIP_CTRL_BASE + 0x4), 0x1234);
 
         // SSI byte / halfword reads cover the non-word widths.
-        assert_eq!(bus.read8(SSI_BASE + 0x28) & 0x5, 0x5);
+        assert_eq!(bus.read8(SSI_BASE + 0x28), 0x6);
 
         // XIP flash byte / halfword after load.
         bus.load_flash(&[0xDE, 0xAD, 0xBE, 0xEF]);
@@ -5445,11 +5445,11 @@ mod stage2_bus_coverage {
         assert_eq!(bus.read16(0x1000_0001), 0x7766);
     }
 
-    /// SSI read at offset 0x28 returns pattern 0x05.
+    /// SSI SR at offset 0x28 of an idle SSI: TFNF | TFE, BUSY clear.
     #[test]
     fn ssi_sr_read_returns_flags() {
         let mut bus = Bus::new();
-        assert_eq!(bus.read32(SSI_BASE + 0x28) & 0x5, 0x5);
+        assert_eq!(bus.read32(SSI_BASE + 0x28), 0x6);
         // Other SSI offsets default to 0.
         let _ = bus.read32(SSI_BASE);
     }

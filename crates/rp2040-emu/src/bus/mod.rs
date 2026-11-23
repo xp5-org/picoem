@@ -26,7 +26,7 @@ pub mod resets;
 pub mod sio;
 pub mod systick;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::Write;
 
 use tracing::debug;
@@ -327,8 +327,13 @@ pub struct Bus {
     xip_sram: Box<[u8; XIP_SRAM_SIZE]>,
     /// XIP_CTRL register backing store (stub — firmware round-trips only).
     xip_ctrl_regs: HashMap<u32, u32>,
-    /// SSI register backing store (stub).
+    /// SSI register backing store.
     ssi_regs: HashMap<u32, u32>,
+    /// SSI receive FIFO. Each byte written to DR0 while the SSI is
+    /// enabled shifts one byte back from the serial flash model.
+    ssi_rx: VecDeque<u8>,
+    /// Bytes sent to the flash since chip select went low.
+    ssi_cmd: Vec<u8>,
     /// Catch-all APB peripheral register backing store for blocks we
     /// don't model in detail (PSM / BUSCTRL / SYSCFG / IO_QSPI / PADS_QSPI /
     /// UART / SPI / I2C / ADC / PWM / TIMER / WATCHDOG / RTC / VREG / TBMAN).
@@ -496,6 +501,8 @@ impl Bus {
             xip_sram: Box::new([0u8; XIP_SRAM_SIZE]),
             xip_ctrl_regs: HashMap::new(),
             ssi_regs: HashMap::new(),
+            ssi_rx: VecDeque::new(),
+            ssi_cmd: Vec::new(),
             peripheral_regs: HashMap::new(),
             pio: [PioBlock::new(), PioBlock::new()],
             watchdog_tick: WatchdogTickRegs::new(),
@@ -982,6 +989,11 @@ impl Bus {
                     _ => val,
                 };
                 self.peripheral_regs.insert(canonical, new);
+                // GPIO_QSPI_SS_CTRL: a change of the chip-select output
+                // override starts a new flash command.
+                if canonical == IO_QSPI_BASE + 0x0c && (old ^ new) & 0x300 != 0 {
+                    self.ssi_cmd.clear();
+                }
             }
         }
     }
@@ -1009,17 +1021,61 @@ impl Bus {
         self.xip_ctrl_regs.insert(offset, val);
     }
 
-    fn ssi_read(&self, offset: u32) -> u32 {
-        // SSI_SR (offset 0x28) is polled frequently; report TFE|BF set so
-        // firmware transmit-wait loops terminate. Other regs return 0.
+    /// SSI in direct mode, the path the bootrom's flash_do_cmd and the
+    /// SDK's flash routines take. Transmit completes at once, so TXFLR is
+    /// always 0; RXFLR is the number of reply bytes waiting.
+    fn ssi_read(&mut self, offset: u32) -> u32 {
         match offset {
-            0x28 => 0x04 | 0x01, // TFE | BUSY-cleared
+            0x20 => 0,                                  // TXFLR
+            0x24 => self.ssi_rx.len() as u32,           // RXFLR
+            // SR: TFNF | TFE, plus RFNE when a reply byte waits. BUSY is
+            // bit 0 and stays clear.
+            0x28 => 0x06 | if self.ssi_rx.is_empty() { 0 } else { 0x08 },
+            0x60 => self.ssi_rx.pop_front().unwrap_or(0) as u32, // DR0
             _ => *self.ssi_regs.get(&offset).unwrap_or(&0),
         }
     }
 
     fn ssi_write(&mut self, offset: u32, val: u32) {
-        self.ssi_regs.insert(offset, val);
+        match offset {
+            0x60 => {
+                if self.ssi_regs.get(&0x08).copied().unwrap_or(0) & 1 != 0 {
+                    let reply = self.flash_reply(val as u8);
+                    self.ssi_rx.push_back(reply);
+                }
+            }
+            0x08 => {
+                // SSIENR: disabling the SSI empties its FIFOs.
+                if val & 1 == 0 {
+                    self.ssi_rx.clear();
+                }
+                self.ssi_regs.insert(offset, val);
+            }
+            _ => {
+                self.ssi_regs.insert(offset, val);
+            }
+        }
+    }
+
+    /// Serial NOR flash reply to one byte of a command, W25Q16-style:
+    /// 0x03 read, 0x05/0x35 status, 0x4B unique ID, 0x9F JEDEC ID, 0xAB
+    /// release from power-down. Program and erase commands are accepted and
+    /// change nothing; the flash contents are the loaded image.
+    fn flash_reply(&mut self, tx: u8) -> u8 {
+        self.ssi_cmd.push(tx);
+        let i = self.ssi_cmd.len() - 1;
+        let cmd = self.ssi_cmd[0];
+        match cmd {
+            0x03 if i >= 4 => {
+                let a = &self.ssi_cmd;
+                let addr = ((a[1] as u32) << 16 | (a[2] as u32) << 8 | a[3] as u32) + (i as u32 - 4);
+                self.memory.xip_read8(addr & 0x00ff_ffff)
+            }
+            0x4B if i >= 5 => [0xE6, 0x61, 0x41, 0x04, 0x03, 0x2F, 0x28, 0x2E][(i - 5) % 8],
+            0x9F if (1..=3).contains(&i) => [0xEF, 0x40, 0x15][i - 1],
+            0xAB if i >= 4 => 0x14,
+            _ => 0,
+        }
     }
 
     // ----------------------------------------------------------------
@@ -1914,12 +1970,20 @@ impl Bus {
     /// by `cycles` sysclks via `tick(cycles, clock_tree, irqs)` and OR
     /// any level-driven IRQs into `irq_pending`.
     ///
-    /// Per HLD 2026.04.26 V5 §5.1: chunked once-per-quantum advance
-    /// replaces the previous per-cycle interleave. `tick_dma` still
-    /// runs once per quantum at the tail to preserve the "peripherals
-    /// produce DREQ, then DMA consumes the snapshot" ordering.
+    /// Per HLD 2026.04.26 V5 §5.1: chunked once-per-quantum advance.
+    /// `tick_dma` runs once at the tail, after the peripherals produce
+    /// DREQ. [`crate::Emulator::step`]'s slow path instead calls
+    /// [`Self::tick_peripherals_no_dma`] and ticks DMA once per system
+    /// cycle, interleaved with PIO, while a channel is busy.
     #[inline]
     pub fn tick_peripherals(&mut self, cycles: u32) {
+        self.tick_peripherals_no_dma(cycles);
+        self.tick_dma();
+    }
+
+    /// [`Self::tick_peripherals`] without the DMA tick.
+    #[inline]
+    pub fn tick_peripherals_no_dma(&mut self, cycles: u32) {
         // TIMER alarms are lazy-fire at match: `poll_alarms` is cheap
         // (four armed-bit checks) and we run it here so firmware
         // stepping in the slow path observes alarm-match IRQs on the
@@ -1948,10 +2012,6 @@ impl Bus {
         // PWM: per-slice counter advance + wrap-IRQ latch.
         self.pwm
             .tick(cycles, &self.clock_tree, &mut self.irq_pending);
-        // DMA ticks LAST per HLD V7 §5.6 ordering contract — peripherals
-        // produce DREQ on this cycle, DMA snapshots + consumes. Stays
-        // once per quantum; mirrors RP2350.
-        self.tick_dma();
     }
 
     /// Fast-path lazy-schedule advance (HLD V7 §5.5).
@@ -2229,6 +2289,34 @@ mod tests {
         assert_eq!(bus.read8(0x1000_0000), 0xAA);
         assert_eq!(bus.read8(0x1000_0003), 0xDD);
         assert_eq!(bus.read16(0x1000_0002), 0xDDCC);
+    }
+
+    /// Direct-mode SSI, the way the bootrom's flash_do_cmd drives it: CS
+    /// forced low through IO_QSPI SS_CTRL.OUTOVER, one DR0 write per byte,
+    /// one reply byte per write in the RX FIFO.
+    #[test]
+    fn ssi_flash_commands_reply() {
+        let mut bus = Bus::new();
+        bus.load_flash(&[0x10, 0x11, 0x12, 0x13, 0x14, 0x15]);
+        let xfer = |bus: &mut Bus, tx: &[u8]| -> Vec<u8> {
+            bus.write32(IO_QSPI_BASE + 0x0c, 0x300); // CS high
+            bus.write32(IO_QSPI_BASE + 0x0c, 0x200); // CS low: new command
+            for &b in tx {
+                bus.write32(SSI_BASE + 0x60, b as u32);
+            }
+            assert_eq!(bus.read32(SSI_BASE + 0x24), tx.len() as u32, "RXFLR");
+            assert_ne!(bus.read32(SSI_BASE + 0x28) & 0x08, 0, "SR.RFNE");
+            (0..tx.len()).map(|_| bus.read32(SSI_BASE + 0x60) as u8).collect()
+        };
+        bus.write32(SSI_BASE + 0x08, 1); // SSIENR
+        assert_eq!(xfer(&mut bus, &[0x9F, 0, 0, 0]), [0, 0xEF, 0x40, 0x15]);
+        assert_eq!(xfer(&mut bus, &[0x03, 0, 0, 2, 0, 0]), [0, 0, 0, 0, 0x12, 0x13]);
+        assert_eq!(xfer(&mut bus, &[0x05, 0]), [0, 0]);
+        assert_eq!(bus.read32(SSI_BASE + 0x28) & 0x09, 0, "SR: not busy, RX empty");
+        // Disabling the SSI empties the RX FIFO.
+        bus.write32(SSI_BASE + 0x60, 0);
+        bus.write32(SSI_BASE + 0x08, 0);
+        assert_eq!(bus.read32(SSI_BASE + 0x24), 0);
     }
 
     #[test]

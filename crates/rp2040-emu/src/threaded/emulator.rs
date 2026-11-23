@@ -105,7 +105,9 @@ impl ThreadedEmulator {
             bus,
             clock,
             step_quantum,
-            // Diagnostic counters are serial-path only — drop on handoff.
+            // The pin trace and diagnostic counters are serial-path only;
+            // they drop on handoff.
+            gpio_trace: _,
             pio_tick_count: _,
             pio_tick_iow_low_count: _,
             pio0_sm0_max_pc: _,

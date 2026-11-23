@@ -217,6 +217,11 @@ pub struct Emulator {
     pub clock: Clock,
     /// Cycles advanced per call to [`Self::step`].
     pub step_quantum: u32,
+    /// Pin trace for harnesses that rebuild a signal from the pins. While
+    /// `Some`, every system cycle appends the merged GPIO level word, and
+    /// PIO steps one cycle at a time so no edge inside a quantum is lost.
+    /// `None` costs nothing. Serial model only.
+    pub gpio_trace: Option<Vec<u32>>,
     /// Total PIO ticks performed in the slow path
     /// (`tick_pio_and_route_irqs`). Diagnostic-only — used by the
     /// PicoGUS harness to confirm PIO is actually being driven.
@@ -791,6 +796,9 @@ impl Emulator {
             self.bus.advance_lazy_scheduled(consumed);
             self.drain_pending_irqs_to_cores();
             self.update_gpio();
+            if let Some(t) = self.gpio_trace.as_mut() {
+                t.extend(std::iter::repeat_n(self.bus.gpio_in, consumed as usize));
+            }
         } else {
             // Per HLD 2026.04.26 V5 §5.3: chunked once-per-quantum slow
             // branch. `master_cycle` advances by `consumed` BEFORE
@@ -798,14 +806,35 @@ impl Emulator {
             // window's end-of-quantum cycle. SysTick advances per-core
             // by each core's actual consumed cycle count (mirrors M0+
             // hardware: SysTick is per-core, decremented on the cycles
-            // the owning core consumes — see §5.2.3). PIO and IRQ drain
-            // run once at quantum end; net IRQ-delivery latency grows
-            // from ≤1 cycle to ≤step_quantum-1 cycles (see §5.4).
+            // the owning core consumes — see §5.2.3). IRQ drain runs once
+            // at quantum end, so IRQ delivery lags by up to step_quantum-1
+            // cycles; §5.4 has the analysis.
             self.bus.master_cycle = self.bus.master_cycle.wrapping_add(consumed);
-            self.bus.tick_peripherals(consumed as u32);
+            self.bus.tick_peripherals_no_dma(consumed as u32);
             self.tick_systick(c0_total as u32, c1_total as u32);
-            self.tick_pio_and_route_irqs(consumed as u32);
-            self.update_gpio();
+            // DMA moves at most one word per system cycle, and a PIO FIFO
+            // it feeds drains on the PIO's own clock, so while a channel
+            // is busy the two step together, one cycle at a time. Once
+            // every channel is idle the rest of the quantum is chunked.
+            // A pin trace also needs the per-cycle loop.
+            let tracing = self.gpio_trace.is_some();
+            let mut left = consumed as u32;
+            while left > 0 {
+                if !tracing && self.bus.dma.is_idle() {
+                    self.bus.tick_dma();
+                    self.tick_pio_and_route_irqs(left);
+                    self.update_gpio();
+                    break;
+                }
+                self.bus.tick_dma();
+                self.tick_pio_and_route_irqs(1);
+                self.update_gpio();
+                let g = self.bus.gpio_in;
+                if let Some(t) = self.gpio_trace.as_mut() {
+                    t.push(g);
+                }
+                left -= 1;
+            }
             self.drain_pending_irqs_to_cores();
         }
         self.wake_checks();
@@ -1078,6 +1107,7 @@ impl Emulator {
             bus: seeded_bus,
             clock: seeded_clock,
             step_quantum: self.step_quantum,
+            gpio_trace: None,
             pio_tick_count: self.pio_tick_count,
             pio_tick_iow_low_count: self.pio_tick_iow_low_count,
             pio0_sm0_max_pc: self.pio0_sm0_max_pc,
@@ -1140,6 +1170,8 @@ impl Emulator {
             let pio_mask = pio.pad_oe;
             out = (out & !pio_mask) | (pio.pad_out & pio_mask);
         }
+        let io = &self.bus.io_bank0;
+        out = ((out ^ io.out_invert) & !io.out_low) | io.out_high;
         out &= 0x3FFF_FFFF;
         if let Some(ref mut psram) = self.bus.psram
             && let Some(miso) = psram.tick(out)
@@ -1477,6 +1509,7 @@ impl EmulatorBuilder {
             bus,
             clock: Clock { cycles: 0 },
             step_quantum: self.step_quantum,
+            gpio_trace: None,
             pio_tick_count: 0,
             pio_tick_iow_low_count: 0,
             pio0_sm0_max_pc: 0,

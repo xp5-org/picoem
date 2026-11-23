@@ -25,7 +25,6 @@
 //!
 //! * CRC (`SNIFF_CTRL` registers — storage-only).
 //! * Sniff (`SNIFF_DATA` — storage-only).
-//! * Byte-swap (`BSWAP` bit) — field stored but ignored.
 //! * `HIGH_PRIORITY` two-tier arbitration.
 //! * `DMA_IRQ_2` / `DMA_IRQ_3`.
 //! * Read-error / write-error IRQs.
@@ -164,9 +163,7 @@ const CTRL_CHAIN_TO_MASK: u32 = 0xF << CTRL_CHAIN_TO_SHIFT;
 const CTRL_TREQ_SEL_SHIFT: u32 = 17;
 const CTRL_TREQ_SEL_MASK: u32 = 0x3F << CTRL_TREQ_SEL_SHIFT;
 const CTRL_IRQ_QUIET: u32 = 1 << 23;
-/// `BSWAP` (byte-swap) flag — not modelled in V1 (HLD V5 §5.6 "Not in
-/// V1"). Stored through CTRL RMW but ignored on transfer. Used by
-/// [`Dma::check_inert_ctrl_bits`] for warn-once.
+/// `BSWAP`: reverse the bytes of each halfword or word in flight.
 const CTRL_BSWAP: u32 = 1 << 24;
 /// `SNIFF_EN` — not modelled in V1 (no CRC). Stored but ignored.
 #[allow(dead_code)]
@@ -323,9 +320,6 @@ pub struct Dma {
     timer_dreq_asserted: [bool; 4],
     sniff_ctrl: u32,
     sniff_data: u32,
-    /// Warn-once latch for `CHn_CTRL.BSWAP` bit set on a channel
-    /// (HLD V5 §4.A2 site 1). Byte-swap is not modelled.
-    warned_bswap: [bool; NUM_CHANNELS],
     /// Warn-once latch for `CHn_CTRL.HIGH_PRIORITY` bit set on a channel
     /// (HLD V5 §4.A2 site 4). Two-tier priority is not modelled.
     warned_high_priority: [bool; NUM_CHANNELS],
@@ -370,7 +364,6 @@ impl Dma {
             timer_dreq_asserted: [false; 4],
             sniff_ctrl: 0,
             sniff_data: 0,
-            warned_bswap: [false; NUM_CHANNELS],
             warned_high_priority: [false; NUM_CHANNELS],
             warned_sniff_ctrl_en: false,
             warned_sniff_data: false,
@@ -670,20 +663,12 @@ impl Dma {
         }
     }
 
-    /// Warn-once per channel when firmware sets `CTRL.BSWAP` (bit 24)
-    /// or `CTRL.HIGH_PRIORITY` (bit 1) — inert registers inside the
-    /// modelled DMA peripheral (HLD V5 §4.A2 sites 1 & 4). Byte-swap
-    /// and two-tier priority are not modelled; storage round-trips
-    /// but transfer behaviour ignores these bits.
+    /// Warn-once per channel when firmware sets `CTRL.HIGH_PRIORITY`,
+    /// bit 1, an inert bit inside the modelled DMA peripheral: HLD V5
+    /// §4.A2 site 4. Two-tier priority is not modelled; storage
+    /// round-trips but arbitration ignores the bit.
     #[inline]
     fn check_inert_ctrl_bits(&mut self, ch_idx: usize, ctrl: u32) {
-        if (ctrl & CTRL_BSWAP) != 0 && !self.warned_bswap[ch_idx] {
-            self.warned_bswap[ch_idx] = true;
-            tracing::warn!(
-                channel = ch_idx,
-                "DMA CHn_CTRL.BSWAP set; byte-swap not modelled"
-            );
-        }
         if (ctrl & CTRL_HIGH_PRIORITY) != 0 && !self.warned_high_priority[ch_idx] {
             self.warned_high_priority[ch_idx] = true;
             tracing::warn!(
@@ -792,7 +777,7 @@ impl Dma {
     }
 
     fn issue_transfer(&mut self, ch_idx: usize, bus: &mut Bus) {
-        let (read_addr, write_addr, size, incr_read, incr_write, ring, ring_on_write) = {
+        let (read_addr, write_addr, size, incr_read, incr_write, ring, ring_on_write, bswap) = {
             let ch = &self.channels[ch_idx];
             (
                 ch.read_addr,
@@ -802,6 +787,7 @@ impl Dma {
                 (ch.ctrl & CTRL_INCR_WRITE) != 0,
                 ch.ring_size(),
                 ch.ring_on_write(),
+                (ch.ctrl & CTRL_BSWAP) != 0,
             )
         };
 
@@ -815,7 +801,7 @@ impl Dma {
         // Real silicon's AHB carries DMA self-accesses to the DMA
         // peripheral the same as any other master would; this branch
         // emulates that.
-        let value = self.dma_routed_read(read_addr, size, bus);
+        let value = byte_swap(self.dma_routed_read(read_addr, size, bus), size, bswap);
         self.dma_routed_write(write_addr, value, size, bus);
 
         // Test-only push-event observable. Recorded inside
@@ -960,6 +946,17 @@ impl Dma {
         if (self.intr | self.intf3) & self.inte3 != 0 {
             atomics.assert_irq_shared(IRQ_DMA_IRQ_3);
         }
+    }
+}
+
+/// CTRL.BSWAP: a word transfer reverses its four bytes, a halfword swaps
+/// its two, a byte is unchanged.
+#[inline]
+fn byte_swap(value: u32, size: u32, bswap: bool) -> u32 {
+    match (bswap, size) {
+        (true, 4) => value.swap_bytes(),
+        (true, 2) => (value as u16).swap_bytes() as u32,
+        _ => value,
     }
 }
 
@@ -2012,29 +2009,6 @@ mod tests {
             .filter(|line| line.starts_with("WARN"))
             .filter(|line| line.contains(needle))
             .count()
-    }
-
-    #[test]
-    fn bswap_warn_fires_once_per_channel() {
-        let captured: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-        let subscriber = CaptureSubscriber {
-            events: captured.clone(),
-        };
-        tracing::subscriber::with_default(subscriber, || {
-            let mut dma = Dma::new();
-            // Two BSWAP-set writes on channel 3 — one warn.
-            dma.write32(3 * 0x40 + CH_AL1_CTRL, CTRL_BSWAP, 0);
-            dma.write32(3 * 0x40 + CH_AL1_CTRL, CTRL_BSWAP, 0);
-            // One BSWAP-set write on channel 7 — separate warn.
-            dma.write32(7 * 0x40 + CH_AL1_CTRL, CTRL_BSWAP, 0);
-        });
-        let events = captured.lock().unwrap();
-        let matches = count_warns_containing(&events, "BSWAP");
-        assert_eq!(
-            matches, 2,
-            "expected one BSWAP warn per affected channel; got {} in {:?}",
-            matches, *events
-        );
     }
 
     #[test]

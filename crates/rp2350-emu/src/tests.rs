@@ -29126,28 +29126,19 @@ mod stage3_dma_residue {
         assert_eq!(dma.channel(0).trans_count, 0xF0);
     }
 
-    /// CTRL_TRIG with `BSWAP` set fires the warn-once latch via the
-    /// `CTRL_TRIG` path (separate code path from `AL1_CTRL`). Issuing
-    /// the same write twice must still warn only once.
+    /// CTRL.BSWAP reverses the four bytes of a word transfer.
     #[test]
-    fn ctrl_trig_bswap_warn_fires_once() {
-        // Use the bus path so check_inert_ctrl_bits is reached via
-        // CTRL_TRIG, not just AL1_CTRL.
+    fn ctrl_trig_bswap_reverses_word() {
         let mut bus = Bus::new();
         release_dma(&mut bus);
+        bus.write32(0x2000_0100, 0x1122_3344, 0);
         let c = ctrl(true, 2, true, true, DREQ_FORCE, 0, 0, false) | CTRL_BSWAP;
         bus.write32(DMA_BASE + CH_TRANS_COUNT, 1, 0);
         bus.write32(DMA_BASE, 0x2000_0100, 0);
         bus.write32(DMA_BASE + CH_WRITE_ADDR, 0x2000_0200, 0);
         bus.write32(DMA_BASE + CH_CTRL_TRIG, c, 0);
-        // No assertion on stdout — the warn-once latch lives on the Dma
-        // struct itself; we just exercise the path so coverage records
-        // both arms of the inert-bits guard.
-        let r = bus.read32(DMA_BASE + CH_CTRL_TRIG, 0);
-        // BSWAP is at bit 24 — masked out of CTRL_WRITABLE_MASK so the
-        // readback should NOT report BSWAP set. (Bit 24 is BSWAP — we
-        // only need to confirm the channel still arms.)
-        assert_ne!(r & CTRL_BUSY, 0);
+        bus.tick_dma();
+        assert_eq!(bus.read32(0x2000_0200, 0), 0x4433_2211);
     }
 
     /// CTRL_TRIG with HIGH_PRIORITY set — same shape, separate latch.

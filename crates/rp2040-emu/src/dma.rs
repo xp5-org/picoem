@@ -26,7 +26,6 @@
 //!
 //! * CRC (`SNIFF_CTRL` registers — storage-only).
 //! * Sniff (`SNIFF_DATA` — storage-only).
-//! * Byte-swap (`BSWAP` bit) — field stored but ignored.
 //! * `HIGH_PRIORITY` two-tier arbitration.
 //! * Ring across non-aligned base address.
 //! * Read-error / write-error IRQs.
@@ -110,9 +109,7 @@ const CTRL_CHAIN_TO_MASK: u32 = 0xF << CTRL_CHAIN_TO_SHIFT;
 const CTRL_TREQ_SEL_SHIFT: u32 = 15;
 const CTRL_TREQ_SEL_MASK: u32 = 0x3F << CTRL_TREQ_SEL_SHIFT;
 const CTRL_IRQ_QUIET: u32 = 1 << 21;
-/// `BSWAP` (byte-swap) flag — not modelled in V1 (HLD §5.6.1 "Not in
-/// V1"). Stored through CTRL RMW but ignored on transfer.
-#[allow(dead_code)]
+/// `BSWAP`: reverse the bytes of each halfword or word in flight.
 const CTRL_BSWAP: u32 = 1 << 22;
 /// `SNIFF_EN` — not modelled in V1 (no CRC). Stored but ignored.
 #[allow(dead_code)]
@@ -591,7 +588,7 @@ impl Dma {
         // observation; does not alter control flow.
         self.channels[ch_idx].transfers_issued =
             self.channels[ch_idx].transfers_issued.wrapping_add(1);
-        let (read_addr, write_addr, size, incr_read, incr_write, ring, ring_on_write) = {
+        let (read_addr, write_addr, size, incr_read, incr_write, ring, ring_on_write, bswap) = {
             let ch = &self.channels[ch_idx];
             (
                 ch.read_addr,
@@ -601,21 +598,19 @@ impl Dma {
                 (ch.ctrl & CTRL_INCR_WRITE) != 0,
                 ch.ring_size(),
                 ch.ring_on_write(),
+                (ch.ctrl & CTRL_BSWAP) != 0,
             )
         };
 
         // Issue one transfer. Real AHB would split address / data
-        // phases; emulator collapses into one cycle.
-        let value = match size {
-            1 => bus.read8(read_addr) as u32,
-            2 => bus.read16(read_addr) as u32,
-            _ => bus.read32(read_addr),
-        };
-        match size {
-            1 => bus.write8(write_addr, value as u8),
-            2 => bus.write16(write_addr, value as u16),
-            _ => bus.write32(write_addr, value),
-        }
+        // phases; emulator collapses into one cycle. An access inside
+        // the DMA register aperture goes to `self`: `Bus::tick_dma`
+        // holds the live DMA outside the bus for the tick, so the bus's
+        // DMA_BASE arm would reach an empty stand-in. This is the
+        // control-block pattern, one channel writing another channel's
+        // registers and its CTRL_TRIG.
+        let value = byte_swap(self.dma_routed_read(read_addr, size, bus), size, bswap);
+        self.dma_routed_write(write_addr, value, size, bus);
 
         // Update addresses.
         let ch = &mut self.channels[ch_idx];
@@ -656,6 +651,48 @@ impl Dma {
         }
     }
 
+    /// True iff `addr` falls in the DMA register page or one of its
+    /// XOR / SET / CLR alias mirrors.
+    #[inline]
+    fn is_dma_aperture(addr: u32) -> bool {
+        addr.wrapping_sub(crate::bus::DMA_BASE) < 0x4000
+    }
+
+    /// One DMA-master read. DMA registers are 32-bit; a narrow read picks
+    /// its bytes out of the word, little endian.
+    #[inline]
+    fn dma_routed_read(&self, addr: u32, size: u32, bus: &mut Bus) -> u32 {
+        if Self::is_dma_aperture(addr) {
+            let word = self.read32(addr & 0x0000_0FFC);
+            match size {
+                1 => (word >> ((addr & 3) * 8)) & 0xFF,
+                2 => (word >> ((addr & 2) * 8)) & 0xFFFF,
+                _ => word,
+            }
+        } else {
+            match size {
+                1 => bus.read8(addr) as u32,
+                2 => bus.read16(addr) as u32,
+                _ => bus.read32(addr),
+            }
+        }
+    }
+
+    /// One DMA-master write. A write into the DMA aperture applies the
+    /// alias of its address; channel registers are word-wide.
+    #[inline]
+    fn dma_routed_write(&mut self, addr: u32, value: u32, size: u32, bus: &mut Bus) {
+        if Self::is_dma_aperture(addr) {
+            self.write32(addr & 0x0000_0FFF, value, (addr >> 12) & 3);
+        } else {
+            match size {
+                1 => bus.write8(addr, value as u8),
+                2 => bus.write16(addr, value as u16),
+                _ => bus.write32(addr, value),
+            }
+        }
+    }
+
     /// OR DMA IRQ lines into the bus `irq_pending` wire. Call this after
     /// [`Self::tick`] so the NVIC latches any just-completed transfer.
     pub fn route_irqs(&self, irq_pending: &mut u32) {
@@ -665,6 +702,17 @@ impl Dma {
         if (self.intr | self.intf1) & self.inte1 != 0 {
             *irq_pending |= 1u32 << IRQ_DMA_IRQ_1;
         }
+    }
+}
+
+/// CTRL.BSWAP: a word transfer reverses its four bytes, a halfword swaps
+/// its two, a byte is unchanged.
+#[inline]
+fn byte_swap(value: u32, size: u32, bswap: bool) -> u32 {
+    match (bswap, size) {
+        (true, 4) => value.swap_bytes(),
+        (true, 2) => (value as u16).swap_bytes() as u32,
+        _ => value,
     }
 }
 
@@ -831,6 +879,52 @@ mod tests {
         assert_eq!(bus.read32(DMA_BASE + REG_N_CHANNELS), 0);
         release_dma(&mut bus);
         assert_eq!(bus.read32(DMA_BASE + REG_N_CHANNELS), NUM_CHANNELS as u32);
+    }
+
+    #[test]
+    fn bswap_reverses_words_and_halfwords() {
+        let mut bus = Bus::new();
+        release_dma(&mut bus);
+        bus.write32(0x2000_0100, 0x1122_3344);
+        let w = make_ctrl(true, true, true, 2, 0, DREQ_FORCE, 0, false, false) | CTRL_BSWAP;
+        program_channel(&mut bus, 0, 0x2000_0100, 0x2000_0200, 1, w);
+        trigger_channel_via_ctrl_trig(&mut bus, 0, w);
+        bus.tick_dma();
+        assert_eq!(bus.read32(0x2000_0200), 0x4433_2211);
+
+        let h = make_ctrl(true, true, true, 1, 1, DREQ_FORCE, 0, false, false) | CTRL_BSWAP;
+        program_channel(&mut bus, 1, 0x2000_0100, 0x2000_0300, 2, h);
+        trigger_channel_via_ctrl_trig(&mut bus, 1, h);
+        bus.tick_dma();
+        bus.tick_dma();
+        // Halfwords 0x3344 then 0x1122 land as 0x4433 then 0x2211.
+        assert_eq!(bus.read32(0x2000_0300), 0x2211_4433);
+    }
+
+    /// The control-block pattern: CH1 copies four words into CH0's
+    /// READ_ADDR / WRITE_ADDR / TRANS_COUNT / CTRL_TRIG, and the last of
+    /// them starts CH0.
+    #[test]
+    fn dma_programs_dma_through_ctrl_trig() {
+        let mut bus = Bus::new();
+        release_dma(&mut bus);
+        let c0 = make_ctrl(true, true, true, 2, 0, DREQ_FORCE, 0, false, false);
+        let block = [0x2000_0100u32, 0x2000_0200, 2, c0];
+        for (i, w) in block.iter().enumerate() {
+            bus.write32(0x2000_0400 + 4 * i as u32, *w);
+        }
+        bus.write32(0x2000_0100, 0xAAAA_0001);
+        bus.write32(0x2000_0104, 0xBBBB_0002);
+        // Write ring of 16 bytes over CH0's first four registers.
+        let c1 = make_ctrl(true, true, true, 2, 1, DREQ_FORCE, 4, true, false);
+        program_channel(&mut bus, 1, 0x2000_0400, DMA_BASE, 4, c1);
+        trigger_channel_via_ctrl_trig(&mut bus, 1, c1);
+        for _ in 0..8 {
+            bus.tick_dma();
+        }
+        assert_eq!(bus.read32(0x2000_0200), 0xAAAA_0001);
+        assert_eq!(bus.read32(0x2000_0204), 0xBBBB_0002);
+        assert!(!bus.dma.channel(0).busy);
     }
 
     #[test]

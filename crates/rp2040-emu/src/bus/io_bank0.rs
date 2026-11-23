@@ -20,6 +20,11 @@ pub(crate) const NUM_GPIOS: usize = 30;
 pub struct IoBank0 {
     /// GPIO_CTRL[pin] = FUNCSEL / OUTOVER / OEOVER / INOVER / IRQOVER.
     pub ctrl: [u32; NUM_GPIOS],
+    /// Pins whose CTRL.OUTOVER inverts, forces low or forces high the
+    /// peripheral's output level, kept in step with `ctrl` on every write.
+    pub(crate) out_invert: u32,
+    pub(crate) out_low: u32,
+    pub(crate) out_high: u32,
     /// Raw INT / INTE / INTF / INTS storage — 4 × 4 words = 16 words per
     /// bank (4 banks of 8 pins each). Backing store only; interrupt
     /// delivery is not modelled in Phase 5.A.
@@ -44,6 +49,9 @@ impl IoBank0 {
         }
         Self {
             ctrl,
+            out_invert: 0,
+            out_low: 0,
+            out_high: 0,
             intr: [0; 4],
             proc0_inte: [0; 4],
             proc0_intf: [0; 4],
@@ -143,7 +151,20 @@ impl IoBank0 {
             let pin = (off >> 3) as usize;
             match off & 0x7 {
                 0x0 => {} // STATUS read-only
-                0x4 => self.ctrl[pin] = apply(self.ctrl[pin], val),
+                0x4 => {
+                    self.ctrl[pin] = apply(self.ctrl[pin], val);
+                    // OUTOVER, bits 9:8: 0 normal, 1 invert, 2 low, 3 high.
+                    let bit = 1u32 << pin;
+                    self.out_invert &= !bit;
+                    self.out_low &= !bit;
+                    self.out_high &= !bit;
+                    match (self.ctrl[pin] >> 8) & 3 {
+                        1 => self.out_invert |= bit,
+                        2 => self.out_low |= bit,
+                        3 => self.out_high |= bit,
+                        _ => {}
+                    }
+                }
                 _ => {}
             }
             return;
