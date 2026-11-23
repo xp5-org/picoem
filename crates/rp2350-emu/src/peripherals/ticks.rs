@@ -119,10 +119,39 @@ impl Domain {
         }
         self.sys_clks = self.sys_clks.saturating_add(cycles);
         let divisor = self.cycles;
-        let edges = self.sys_clks / divisor;
-        self.sys_clks -= edges * divisor;
+        // LOCAL PATCH (speed, 2026-11-23): per quantum the accumulator
+        // crosses the divisor at most a few times, so subtract instead of
+        // paying an integer division per domain per quantum. Same result.
+        let edges = if self.sys_clks < divisor {
+            0
+        } else if self.sys_clks < 4 * divisor {
+            let mut e = 0;
+            while self.sys_clks >= divisor {
+                self.sys_clks -= divisor;
+                e += 1;
+            }
+            e
+        } else {
+            let e = self.sys_clks / divisor;
+            self.sys_clks -= e * divisor;
+            e
+        };
         self.add_edges(edges);
         edges
+    }
+
+    /// LOCAL PATCH (deadline quanta, 2026-11-23): clk_ref cycles until this
+    /// domain has emitted `n` more edges beyond those already pending, or
+    /// `None` if the divider is stopped.
+    pub fn ref_cycles_until_edges(&self, n: u64) -> Option<u64> {
+        if !self.enable || self.cycles == 0 {
+            return None;
+        }
+        let n = n.saturating_sub(self.pending_edges as u64);
+        if n == 0 {
+            return Some(0);
+        }
+        Some((n * self.cycles as u64).saturating_sub(self.sys_clks as u64))
     }
 
     fn add_edges(&mut self, n: u32) {

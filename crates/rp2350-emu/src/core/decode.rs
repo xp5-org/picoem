@@ -206,6 +206,34 @@ fn classify_thumb32_branch_misc_pure(hw0: u16, hw1: u16) -> bool {
     }
 }
 
+/// LOCAL PATCH (speed, 2026-11-23): plain load encodings the idle-loop
+/// detector may accept inside a poll loop. Conservative: anything not
+/// listed (stores, LDM with writeback to PC, POP {pc}, exclusive / ordered
+/// loads, coprocessor, table branches) is treated as a side effect.
+pub(crate) fn is_idle_load_encoding(hw0: u16, _hw1: u16, wide: bool) -> bool {
+    if !wide {
+        match hw0 >> 11 {
+            0b01001 => true,          // LDR (literal)
+            0b01101 => true,          // LDR (imm)
+            0b01111 => true,          // LDRB (imm)
+            0b10001 => true,          // LDRH (imm)
+            0b10011 => true,          // LDR (SP)
+            0b01010 | 0b01011 => {
+                // load/store register offset: opB = bits [11:9];
+                // 011 LDRSB, 100 LDR, 101 LDRH, 110 LDRB, 111 LDRSH
+                matches!((hw0 >> 9) & 7, 0b011 | 0b100 | 0b101 | 0b110 | 0b111)
+            }
+            0b10111 => (hw0 & 0xFF00) == 0xBC00, // POP without PC
+            _ => false,
+        }
+    } else {
+        // LDR{,B,H,SB,SH}.W: imm12 forms and the imm8 / register / literal group.
+        matches!(hw0 & 0xFFF0, 0xF8D0 | 0xF890 | 0xF8B0 | 0xF990 | 0xF9B0
+            | 0xF850 | 0xF810 | 0xF830 | 0xF910 | 0xF930)
+            || (hw0 & 0xFF7F) == 0xF85F // LDR.W literal (either U)
+    }
+}
+
 /// Pure-classification for the misc-control sub-group of `thumb32_branch_misc`.
 fn classify_thumb32_misc_control_pure(hw0: u16, hw1: u16) -> bool {
     // Hints (hw0 == 0xF3AF): NOP.W / YIELD.W / WFE.W / WFI.W / SEV.W all pure.
@@ -297,7 +325,11 @@ impl CortexM33 {
         } else {
             0xE // AL (always)
         };
-        let cond_passed = self.regs.condition_passed(cond);
+        // LOCAL PATCH (speed): outside an IT block the condition is AL.
+        let cond_passed = if in_it { self.regs.condition_passed(cond) } else { true };
+        self.last_op_pure = is_pure;
+        self.last_op_sleepy = entry.is_sleepy();
+        self.last_op_idle_load = entry.is_idle_load();
 
         if is_pure {
             // Fast path: neither the fetch (handled by the cache) nor
@@ -484,6 +516,14 @@ impl CortexM33 {
         if flag_only {
             flags |= DecodedOp::FLAG_FLAG_ONLY;
         }
+        // BKPT (0xBExx) and the hint space (0xBFx0; 0xF3AF wide) can halt
+        // or park the core without touching the bus.
+        if (!wide && ((hw0 & 0xFF00) == 0xBE00 || (hw0 & 0xFF0F) == 0xBF00)) || (wide && hw0 == 0xF3AF) {
+            flags |= DecodedOp::FLAG_SLEEPY;
+        }
+        if is_idle_load_encoding(hw0, hw1, wide) {
+            flags |= DecodedOp::FLAG_IDLE_LOAD;
+        }
 
         let entry = DecodedOp {
             tag: pc,
@@ -496,6 +536,7 @@ impl CortexM33 {
         if is_cacheable_pc(pc) {
             let slot = ((pc >> 1) & CACHE_INDEX_MASK) as usize;
             self.decode_cache_set(slot, entry);
+            bus.note_code_fetch(pc);
         }
 
         entry

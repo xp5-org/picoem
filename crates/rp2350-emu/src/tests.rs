@@ -3424,7 +3424,7 @@ fn enc_vpop(sd: u16, count: u16) -> (u16, u16) {
 
 /// Encode VSEL<cc>.F32 Sd, Sn, Sm (Armv8-M).
 /// cc ∈ {0=EQ, 1=VS, 2=GE, 3=GT}. Prefix 0xFE.
-/// hw0 = 1111 1110 | 0 cc[1] cc[0] D | Vn
+/// hw0 = 1111 1110 | 0 D cc[1] cc[0] | Vn   (D = hw0[6], cc = hw0[5:4]; matches `fe36 1a01` = vselgt s2,s12,s2)
 /// hw1 = Vd | 1010 | N 0 M 0 | Vm
 fn enc_vsel(cc: u16, sd: u16, sn: u16, sm: u16) -> (u16, u16) {
     let vd = (sd >> 1) & 0xF;
@@ -3433,14 +3433,14 @@ fn enc_vsel(cc: u16, sd: u16, sn: u16, sm: u16) -> (u16, u16) {
     let n = sn & 1;
     let vm = (sm >> 1) & 0xF;
     let m = sm & 1;
-    let hw0 = 0xFE00 | ((cc & 0x3) << 5) | (d << 4) | vn;
+    let hw0 = 0xFE00 | ((cc & 0x3) << 4) | (d << 6) | vn;
     let hw1 = (vd << 12) | 0x0A00 | (n << 7) | (m << 5) | vm;
     (hw0, hw1)
 }
 
 /// Encode VMAXNM.F32 / VMINNM.F32 (Armv8-M).
 /// `op` = 0 → VMAXNM, `op` = 1 → VMINNM.
-/// hw0 = 1111 1110 | 1 0 0 D | Vn
+/// hw0 = 1111 1110 | 1 D 0 0 | Vn
 /// hw1 = Vd | 1010 | N op M 0 | Vm
 fn enc_vmaxminnm(op: u16, sd: u16, sn: u16, sm: u16) -> (u16, u16) {
     let vd = (sd >> 1) & 0xF;
@@ -3449,7 +3449,7 @@ fn enc_vmaxminnm(op: u16, sd: u16, sn: u16, sm: u16) -> (u16, u16) {
     let n = sn & 1;
     let vm = (sm >> 1) & 0xF;
     let m = sm & 1;
-    let hw0 = 0xFE00 | (1 << 7) | (d << 4) | vn;
+    let hw0 = 0xFE00 | (1 << 7) | (d << 6) | vn;
     let hw1 = (vd << 12) | 0x0A00 | (n << 7) | ((op & 1) << 6) | (m << 5) | vm;
     (hw0, hw1)
 }
@@ -9163,6 +9163,12 @@ fn decode_cache_wide_boundary_invalidation() {
         fetch_wait: 0,
         flags: crate::bus::DecodedOp::FLAG_PURE,
     };
+
+    // Entries injected by hand bypass populate_decode_cache, which is what
+    // records fetched code pages for the SMC filter (LOCAL PATCH speed):
+    // record them the way a real fetch would.
+    bus.note_code_fetch(wide_pc);
+    bus.note_code_fetch(wide_pc + 2);
 
     // Writing a halfword at wide_pc+2 must clear the wide slot at N
     // (after draining).
@@ -30535,11 +30541,13 @@ mod stage4_lib_residue_v2 {
         // so it doesn't perform any work that affects the assertion.
         emu.bus.atomics.set_wfe_waiting(0);
         emu.bus.atomics.set_halted(1);
-        let pre_cycles_core0 = emu.cores.expect_arm()[0].cycles;
-        let _ = emu.step().unwrap();
-        // Core 0 is parked → its cycle counter must be unchanged.
-        let post_cycles_core0 = emu.cores.expect_arm()[0].cycles;
-        assert_eq!(pre_cycles_core0, post_cycles_core0);
+        let pre_exec_core0 = emu.cores.expect_arm()[0].counters.decode_execute_cycles;
+        let now = emu.step().unwrap();
+        // Core 0 is parked → it executes nothing, but its cycle counter
+        // follows the master clock (time passes while asleep; LOCAL PATCH
+        // 2026-11-23, see step_pair_arm).
+        assert_eq!(emu.cores.expect_arm()[0].counters.decode_execute_cycles, pre_exec_core0);
+        assert_eq!(emu.cores.expect_arm()[0].cycles, now);
     }
 
     // ------------------- run_pair_arm: exclusive-monitor snoop (line 1477) -------------------
@@ -35449,4 +35457,39 @@ fn resets_narrow_writes_widen_to_32_bit() {
     bus.write32(0x4002_0000, 0x0000_0000, 0);
     bus.write16(0x4002_2002, 0xABCD, 0);
     assert_eq!(bus.read32(0x4002_0000, 0), 0xABCD_0000);
+}
+
+/// Regression: encodings emitted by clang for the NE0K FFT (`vselgt.f32 s2, s12, s2` =
+/// 0xFE36 0x1A01). The old decode took D from hw0[4] and cc from hw0[6:5], so this wrote
+/// s3 under VS instead of s2 under GT.
+#[test]
+fn fpu_vselgt_clang_encoding_odd_d_bit_and_cc() {
+    let (hw0, hw1) = enc_vsel(3, 2, 12, 2);
+    assert_eq!((hw0, hw1), (0xFE36, 0x1A01));
+}
+
+/// LOCAL PATCH (speed, 2026-11-23): stores to SRAM pages that never held
+/// fetched code queue no decode-cache invalidations; stores that touch a
+/// code page (directly, through an atomic alias, or by spilling into it
+/// from the previous page) still do.
+#[test]
+fn smc_invalidation_filtered_by_code_page() {
+    let (_core, mut bus) = core_and_bus();
+    let code = 0x2000_1000u32;
+    bus.write32(0x2004_0000, 1, 0); // data page, no code fetched
+    assert!(bus.pending_cache_invalidations.is_empty(), "data-only page queued an invalidation");
+    bus.note_code_fetch(code);
+    bus.write32(code + 8, 2, 0);
+    assert!(!bus.pending_cache_invalidations.is_empty(), "store to a code page must queue");
+    bus.pending_cache_invalidations.clear();
+    bus.write32(code + 8 + 0x0100_0000, 3, 0); // XOR alias of the same word
+    assert!(!bus.pending_cache_invalidations.is_empty(), "alias store to a code page must queue");
+    bus.pending_cache_invalidations.clear();
+    // A halfword store at code-4 affects slots code-6 .. code-3, all in
+    // the (code-free) previous page -> filtered. One at code itself
+    // touches the noted page -> queued.
+    bus.write16(code - 4, 4, 0);
+    assert!(bus.pending_cache_invalidations.is_empty(), "store wholly in a code-free page queued");
+    bus.write16(code, 5, 0);
+    assert!(!bus.pending_cache_invalidations.is_empty());
 }

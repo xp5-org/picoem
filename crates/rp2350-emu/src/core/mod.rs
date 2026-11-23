@@ -208,6 +208,8 @@ pub(crate) enum Fault {
 #[derive(Debug, Default, Clone)]
 pub struct CoreCounters {
     pub decode_execute_cycles: u64,
+    /// LOCAL PATCH: instructions retired through `step_serial`.
+    pub instructions: u64,
     pub wfi_cycles: u64,
     pub wfe_cycles: u64,
     pub sram_reads: u64,
@@ -215,6 +217,9 @@ pub struct CoreCounters {
     pub sio_accesses: u64,
     pub peripheral_accesses: u64,
     pub ppb_accesses: u64,
+    /// LOCAL PATCH (speed): cycles the idle-loop skip advanced without
+    /// executing (already included in `decode_execute_cycles`). Diagnostic.
+    pub idle_skipped_cycles: u64,
 }
 
 impl CoreCounters {
@@ -239,6 +244,70 @@ impl CoreCounters {
     }
 }
 
+/// LOCAL PATCH (speed, 2026-11-23): architectural state the idle-loop
+/// detector compares between two visits to a loop head, plus the cycle
+/// and counter values to scale when iterations are skipped.
+pub struct IdleSnap {
+    pub(crate) pc: u32,
+    pub(crate) regs: Registers,
+    pub(crate) it_state: u8,
+    pub(crate) exclusive_address: Option<u32>,
+    pub(crate) dcp_halves: [u32; 16],
+    pub(crate) dcp_status: u32,
+    pub(crate) secure: bool,
+    pub(crate) cycles: u64,
+    pub(crate) counters: CoreCounters,
+}
+
+/// Bitwise equality of two register files (S registers by bit pattern so
+/// NaNs compare equal to themselves).
+fn regs_identical(a: &Registers, b: &Registers) -> bool {
+    a.r == b.r
+        && a.xpsr == b.xpsr
+        && a.primask == b.primask
+        && a.basepri == b.basepri
+        && a.faultmask == b.faultmask
+        && a.control == b.control
+        && a.msp == b.msp
+        && a.psp == b.psp
+        && a.msp_ns == b.msp_ns
+        && a.psp_ns == b.psp_ns
+        && a.msplim == b.msplim
+        && a.psplim == b.psplim
+        && a.msplim_ns == b.msplim_ns
+        && a.psplim_ns == b.psplim_ns
+        && a.primask_ns == b.primask_ns
+        && a.basepri_ns == b.basepri_ns
+        && a.faultmask_ns == b.faultmask_ns
+        && a.control_ns == b.control_ns
+        && a.fpscr == b.fpscr
+        && a.s.iter().zip(b.s.iter()).all(|(x, y)| x.to_bits() == y.to_bits())
+}
+
+/// LOCAL PATCH (speed, 2026-11-23): reads the idle-loop detector treats as
+/// side-effect-free AND constant for the rest of a core's slice in the
+/// Serial scheduler (no other agent runs mid-slice; peripherals and pins
+/// only move at the quantum end): ROM, XIP flash / XIP SRAM, main SRAM,
+/// the TIMER0/1 raw counters, SIO CPUID / GPIO_IN / GPIO_HI_IN. Everything
+/// else (PPB, SIO FIFO / spinlocks / DIV, peripheral FIFOs, latching
+/// registers like TIMELR) counts as a side effect.
+#[inline(always)]
+pub(crate) fn idle_clean_read(addr: u32) -> bool {
+    use crate::peripherals::timer::{TIMER0_BASE, TIMER1_BASE, TIMERAWH_OFFSET, TIMERAWL_OFFSET};
+    match addr >> 28 {
+        0x0 | 0x1 | 0x2 => true,
+        0x4 => {
+            // TIMER0 0x400B_0000 / TIMER1 0x400B_8000 (32 KB apart; atomic
+            // alias bits 12-13 fold into the same register).
+            let base = addr & 0xFFFF_8000;
+            let off = addr & 0xFFF;
+            (base == TIMER0_BASE || base == TIMER1_BASE) && (off == TIMERAWL_OFFSET || off == TIMERAWH_OFFSET)
+        }
+        0xD => matches!(addr & 0xFFF, 0x000 | 0x004 | 0x008),
+        _ => false,
+    }
+}
+
 /// Cortex-M33 CPU core.
 pub struct CortexM33 {
     pub regs: Registers,
@@ -253,6 +322,27 @@ pub struct CortexM33 {
     /// Address of the currently executing instruction. Used to compute
     /// "read PC" value (instr_addr + 4) per ARM architecture definition.
     current_instr_addr: u32,
+    /// LOCAL PATCH (speed): set by `decode_execute`: the op just run was
+    /// classified pure (no bus access, no synchronous fault).
+    pub(crate) last_op_pure: bool,
+    /// LOCAL PATCH (speed): the op just run was BKPT / a hint.
+    pub(crate) last_op_sleepy: bool,
+    /// LOCAL PATCH (speed): the op just run was a plain load encoding.
+    pub(crate) last_op_idle_load: bool,
+    /// LOCAL PATCH (speed): idle-loop detector. Set when the current loop
+    /// iteration did anything that could make iterations differ or have
+    /// effects (store, side-effecting read, exception, hint, coprocessor).
+    pub(crate) idle_dirty: bool,
+    /// Idle-loop detector snapshot at the last loop-head visit.
+    pub(crate) idle_snap: Option<Box<IdleSnap>>,
+    /// Failed snapshot compares this slice (detector backs off after a few).
+    pub(crate) idle_fails: u8,
+    /// LOCAL PATCH (speed): enable the exact idle-loop skip in the Serial
+    /// scheduler (default on). Off = execute every iteration (A/B check).
+    pub idle_skip: bool,
+    /// LOCAL PATCH (speed): the previous instruction could have asserted
+    /// an IRQ (bus access, exception entry); poll `irq_pending` next.
+    pub(crate) irq_check_due: bool,
     /// IT block state. Format: cond[7:4]:mask[3:0]. mask=0 means not in IT block.
     pub(crate) it_state: u8,
     /// Pending synchronous fault from the most recent instruction.
@@ -378,6 +468,14 @@ impl CortexM33 {
             cycles: 0,
             core_id,
             current_instr_addr: 0,
+            last_op_pure: false,
+            last_op_sleepy: false,
+            last_op_idle_load: false,
+            idle_dirty: true,
+            idle_snap: None,
+            idle_fails: 0,
+            idle_skip: true,
+            irq_check_due: true,
             it_state: 0,
             pending_fault: None,
             dcp_halves: [0; 16],
@@ -503,6 +601,188 @@ impl CortexM33 {
 
         self.counters.decode_execute_cycles += cycles as u64;
         self.cycles = self.cycles.wrapping_add(cycles as u64);
+    }
+
+    /// LOCAL PATCH (speed, 2026-11-23): Serial-scheduler step. Same
+    /// semantics as [`Self::step`] for a core the caller has already
+    /// checked is neither halted nor WFE-waiting (`step_pair_arm` does),
+    /// minus per-instruction work that cannot change the outcome:
+    ///   - no repeat of the halted / WFE atomic loads;
+    ///   - exception arbitration only when `exception_may_be_pending`;
+    ///   - no bus-fault poll after a pure op (pure = no bus access);
+    ///   - DWT's cycle snapshot is refreshed on PPB access instead of
+    ///     before every instruction (see `bus_read*` / `bus_write*`).
+    #[inline(always)]
+    pub(crate) fn step_serial<B: CoreBus>(&mut self, bus: &mut B) -> bool {
+        let core = self.core_id as usize;
+        // Only a bus access (or exception entry) by this core can assert an
+        // IRQ while it runs its slice; the slice start merges the rest.
+        if self.irq_check_due {
+            self.irq_check_due = false;
+            let pending = self.atomics.take_irq_pending(core);
+            if pending != 0 {
+                self.ppb.merge_irq_pending(pending);
+            }
+        }
+        if self.ppb.exception_may_be_pending() {
+            if let Some(cost) = self.try_take_any_pending_exception(bus) {
+                self.cycles = self.cycles.wrapping_add(cost as u64);
+                self.irq_check_due = true;
+                self.idle_dirty = true;
+                return true;
+            }
+        }
+        let pc = self.regs.pc();
+        if Some(pc) == self.bootrom_reboot_hook_pc_s || Some(pc) == self.bootrom_reboot_hook_pc_ns {
+            self.bootrom_hook_fired = true;
+            self.atomics.set_halted(core);
+            return true;
+        }
+
+        let mut cycles = self.decode_execute(bus);
+
+        let mut check = !self.last_op_pure || self.last_op_sleepy;
+        if check && !(self.last_op_idle_load && !self.last_op_sleepy) {
+            self.idle_dirty = true;
+        }
+        if !self.last_op_pure {
+            let mut fault_handled = false;
+            if bus.bus_fault(self.core_id) {
+                fault_handled = true;
+                self.idle_dirty = true;
+                let busfault_ena = self.ppb.shcsr & (1 << 17) != 0;
+                self.ppb.cfsr |= (1 << 9) | (1 << 15);
+                self.ppb.bfar = bus.bus_fault_addr(self.core_id);
+                bus.clear_bus_fault(self.core_id);
+                if busfault_ena {
+                    cycles = self.enter_exception(5, bus);
+                } else {
+                    info!(
+                        pc = format_args!("{:#010x}", self.current_instr_addr),
+                        "HardFault escalation from BusFault",
+                    );
+                    self.ppb.hfsr |= 1 << 30;
+                    cycles = self.enter_exception(3, bus);
+                }
+            }
+            if !fault_handled {
+                if let Some(fault) = self.pending_fault.take() {
+                    cycles = self.deliver_fault(fault, bus);
+                    self.idle_dirty = true;
+                }
+            } else {
+                self.pending_fault = None;
+            }
+        } else if let Some(fault) = self.pending_fault.take() {
+            cycles = self.deliver_fault(fault, bus);
+            check = true;
+            self.idle_dirty = true;
+        }
+
+        self.counters.decode_execute_cycles += cycles as u64;
+        self.counters.instructions += 1;
+        self.cycles = self.cycles.wrapping_add(cycles as u64);
+        self.irq_check_due |= check;
+        check
+    }
+
+    /// LOCAL PATCH (speed, 2026-11-23): idle-loop skip for the Serial
+    /// scheduler. Called when the core has just branched backwards to `pc`
+    /// (a loop head). If the iteration that just ended was clean (only
+    /// side-effect-free, slice-constant reads; no stores, exceptions,
+    /// hints or coprocessor ops) and the architectural state equals the
+    /// state at the previous visit, every further iteration in this slice
+    /// is identical: nothing else can change what it reads until the
+    /// quantum ends. Skip as many whole iterations as fit before `target`,
+    /// advancing `cycles` and the counters exactly as executing them would.
+    /// The remainder runs normally, so the result is bit-identical.
+    pub(crate) fn idle_head_visit(&mut self, pc: u32, target: u64) {
+        let clean = !self.idle_dirty;
+        self.idle_dirty = false;
+        if let Some(s) = self.idle_snap.as_deref() {
+            if clean
+                && s.pc == pc
+                && self.pending_fault.is_none()
+                && self.it_state == s.it_state
+                && self.exclusive_address == s.exclusive_address
+                && self.secure == s.secure
+                && self.dcp_status == s.dcp_status
+                && self.dcp_halves == s.dcp_halves
+                && regs_identical(&self.regs, &s.regs)
+            {
+                let iter = self.cycles - s.cycles;
+                if iter > 0 && self.cycles < target {
+                    let k = (target - self.cycles) / iter;
+                    if k > 0 {
+                        let d = |now: u64, then: u64| (now - then) * k;
+                        let c = &mut self.counters;
+                        let o = &s.counters;
+                        let add = [
+                            d(c.decode_execute_cycles, o.decode_execute_cycles),
+                            d(c.instructions, o.instructions),
+                            d(c.wfi_cycles, o.wfi_cycles),
+                            d(c.wfe_cycles, o.wfe_cycles),
+                            d(c.sram_reads, o.sram_reads),
+                            d(c.sram_writes, o.sram_writes),
+                            d(c.sio_accesses, o.sio_accesses),
+                            d(c.peripheral_accesses, o.peripheral_accesses),
+                            d(c.ppb_accesses, o.ppb_accesses),
+                        ];
+                        c.decode_execute_cycles += add[0];
+                        c.instructions += add[1];
+                        c.wfi_cycles += add[2];
+                        c.wfe_cycles += add[3];
+                        c.sram_reads += add[4];
+                        c.sram_writes += add[5];
+                        c.sio_accesses += add[6];
+                        c.peripheral_accesses += add[7];
+                        c.ppb_accesses += add[8];
+                        self.cycles += iter * k;
+                        self.counters.idle_skipped_cycles += iter * k;
+                    }
+                }
+                // Keep the snapshot (state is unchanged), re-based on now.
+                let s = self.idle_snap.as_deref_mut().unwrap();
+                s.cycles = self.cycles;
+                s.counters = self.counters.clone();
+                return;
+            }
+        }
+        if !clean {
+            return; // nothing to compare against next time either
+        }
+        if self.idle_fails >= 4 {
+            return; // back off for the rest of this slice
+        }
+        if self.idle_snap.is_some() {
+            self.idle_fails += 1;
+        }
+        let snap = IdleSnap {
+            pc,
+            regs: self.regs.clone(),
+            it_state: self.it_state,
+            exclusive_address: self.exclusive_address,
+            dcp_halves: self.dcp_halves,
+            dcp_status: self.dcp_status,
+            secure: self.secure,
+            cycles: self.cycles,
+            counters: self.counters.clone(),
+        };
+        match self.idle_snap.as_deref_mut() {
+            Some(s) => *s = snap,
+            None => self.idle_snap = Some(Box::new(snap)),
+        }
+    }
+
+    /// Reset the idle-loop detector at a slice boundary: memory, pins and
+    /// peripherals may have changed while other agents ran.
+    #[inline(always)]
+    pub(crate) fn idle_slice_start(&mut self) {
+        self.idle_dirty = true;
+        self.idle_fails = 0;
+        if let Some(s) = self.idle_snap.as_deref_mut() {
+            s.pc = u32::MAX;
+        }
     }
 
     /// Debug step: clears halted/wfe_waiting before stepping.
@@ -796,7 +1076,11 @@ impl CortexM33 {
 
     pub(crate) fn bus_read32<B: CoreBus>(&mut self, addr: u32, bus: &mut B) -> u32 {
         self.counters.classify_access(addr, false);
+        if !idle_clean_read(addr) {
+            self.idle_dirty = true;
+        }
         if addr >> 28 == 0xE && !Bus::is_boot_ram(addr) {
+            self.ppb.update_latest_cycles(self.cycles); // DWT CYCCNT snapshot (LOCAL PATCH speed)
             let val = self.ppb.read32(addr);
             if bus.mmio_trace_enabled() {
                 bus.emit_mmio_trace('R', 4, addr, val, self.core_id);
@@ -820,6 +1104,7 @@ impl CortexM33 {
         // core's quantum slice and clears the peer's `exclusive_address`.
         self.did_write_this_quantum = true;
         if addr >> 28 == 0xE && !Bus::is_boot_ram(addr) {
+            self.ppb.update_latest_cycles(self.cycles); // DWT CYCCNT snapshot (LOCAL PATCH speed)
             self.ppb.write32(addr, val);
             self.sync_nvic_to_irq_pending(addr, bus);
             if bus.mmio_trace_enabled() {
@@ -837,6 +1122,9 @@ impl CortexM33 {
 
     pub(crate) fn bus_read16<B: CoreBus>(&mut self, addr: u32, bus: &mut B) -> u16 {
         self.counters.classify_access(addr, false);
+        if !idle_clean_read(addr) {
+            self.idle_dirty = true;
+        }
         if addr >> 28 == 0xE && !Bus::is_boot_ram(addr) {
             // ARMv8-M: halfword PPB accesses are UNPREDICTABLE (word-only
             // registers). We defensively compose the result from the
@@ -844,6 +1132,7 @@ impl CortexM33 {
             // firmware sees plausible data. Contrast bus_read8, which
             // returns 0 — byte access is more unusual and worth flagging
             // via a telltale zero.
+            self.ppb.update_latest_cycles(self.cycles); // DWT CYCCNT snapshot (LOCAL PATCH speed)
             let word = self.ppb.read32(addr & !3);
             let val = if addr & 2 != 0 {
                 (word >> 16) as u16
@@ -881,6 +1170,7 @@ impl CortexM33 {
             // defensively RMW the matching half of the containing 32-bit
             // register rather than faulting. Contrast bus_write8, which
             // drops the write — byte writes to PPB are more unusual.
+            self.ppb.update_latest_cycles(self.cycles); // DWT CYCCNT snapshot (LOCAL PATCH speed)
             let old = self.ppb.read32(addr & !3);
             let new_val = if addr & 2 != 0 {
                 (old & 0x0000_FFFF) | ((val as u32) << 16)
@@ -907,6 +1197,9 @@ impl CortexM33 {
 
     pub(crate) fn bus_read8<B: CoreBus>(&mut self, addr: u32, bus: &mut B) -> u8 {
         self.counters.classify_access(addr, false);
+        if !idle_clean_read(addr) {
+            self.idle_dirty = true;
+        }
         if addr >> 28 == 0xE && !Bus::is_boot_ram(addr) {
             // PPB registers are word-access-only; byte reads return 0.
             if bus.mmio_trace_enabled() {

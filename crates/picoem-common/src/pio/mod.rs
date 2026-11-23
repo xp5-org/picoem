@@ -266,6 +266,11 @@ impl PioBlock {
     /// `(INTR_rp2350 & INTE) | INTF`.
     #[inline]
     pub fn int0_ints_rp2350(&self) -> u32 {
+        // LOCAL PATCH (speed, 2026-11-23): nothing enabled -> INTS = INTF;
+        // skip the per-SM FIFO scan (called for every block every quantum).
+        if self.int0_inte == 0 {
+            return self.int0_intf;
+        }
         (self.raw_intr_rp2350() & self.int0_inte) | self.int0_intf
     }
 
@@ -273,6 +278,11 @@ impl PioBlock {
     /// `(INTR_rp2350 & INTE) | INTF`.
     #[inline]
     pub fn int1_ints_rp2350(&self) -> u32 {
+        // LOCAL PATCH (speed, 2026-11-23): nothing enabled -> INTS = INTF;
+        // skip the per-SM FIFO scan (called for every block every quantum).
+        if self.int1_inte == 0 {
+            return self.int1_intf;
+        }
         (self.raw_intr_rp2350() & self.int1_inte) | self.int1_intf
     }
 
@@ -386,9 +396,45 @@ impl PioBlock {
         if self.sm_enabled_mask == 0 {
             return;
         }
-        for _ in 0..n {
+        // LOCAL PATCH (AD9850 probe, 2026-11-23): bulk advance when every
+        // enabled SM is stalled on a condition nothing inside this call can
+        // change (FIFOs only move on bus access, IRQ flags only when an SM
+        // executes, the GPIO sample is fixed for the call). A PIO program
+        // that waits on PULL between data words (most output drivers) then
+        // costs O(1) per quantum instead of O(n). End state is identical to
+        // the per-cycle loop: pins unchanged, divider accumulators and
+        // stall counters advanced. Re-checked after every stepped cycle so
+        // a short burst of activity inside a long quantum only pays for
+        // the cycles it is actually active.
+        let mut left = n;
+        while left > 0 {
+            #[cfg(not(feature = "pio-pad-diag"))]
+            if left > 1 && self.all_quiescent(gpio_pins) {
+                for sm in self.sm.iter_mut() {
+                    let ok = sm.bulk_stall(left);
+                    debug_assert!(ok);
+                }
+                self.merge_pin_outputs();
+                return;
+            }
             self.step_with_pins(gpio_pins);
+            left -= 1;
         }
+    }
+
+    /// LOCAL PATCH (speed): every enabled SM is quiescent-stalled and its
+    /// divider accumulator is in range for `StateMachine::bulk_stall`.
+    #[inline]
+    fn all_quiescent(&self, gpio_pins: u64) -> bool {
+        let gpio_in = self.local_gpio_window(gpio_pins);
+        let flags = self.irq_flags;
+        self.sm.iter().all(|sm| {
+            if !sm.enabled {
+                return true;
+            }
+            let t = if sm.clkdiv_int == 0 { 256 } else { sm.clkdiv_int as u32 * 256 + sm.clkdiv_frac as u32 };
+            sm.clkdiv_acc < t && sm.quiescent(flags, gpio_in)
+        })
     }
 
     #[inline]
@@ -1903,6 +1949,66 @@ mod tests {
 
         step_n(&mut pio, 1, 0); // Execute SET X, 5 (at addr 1)
         assert_eq!(pio.sm[0].x, 5);
+    }
+
+    /// LOCAL PATCH 2026-11-23: the quiescent bulk path in
+    /// `step_n_with_pins` must leave the block in exactly the state the
+    /// per-cycle loop does (fractional clkdiv, stall counters, pins), and
+    /// must not swallow the cycle a stall resolves on.
+    #[test]
+    fn bulk_stall_matches_per_cycle_stepping() {
+        // SET PINDIRS 1; SET PINS 1; PULL block; SET X 5
+        let prog = [0xE081, 0xE001, 0x80A0, 0xE025];
+        let mk = || {
+            let mut p = make_pio_with_program(&prog);
+            p.sm[0].clkdiv_int = 2;
+            p.sm[0].clkdiv_frac = 0x55; // 2.33: not every sysclk is a PIO clock
+            p
+        };
+        let (mut bulk, mut slow) = (mk(), mk());
+        for round in 0..5 {
+            bulk.step_n_with_pins(64, 0);
+            step_n(&mut slow, 64, 0);
+            assert_eq!(bulk.sm[0].stalled, slow.sm[0].stalled, "round {round}");
+            assert_eq!(bulk.sm[0].pc, slow.sm[0].pc, "round {round}");
+            assert_eq!(bulk.sm[0].clkdiv_acc, slow.sm[0].clkdiv_acc, "round {round}");
+            assert_eq!(bulk.sm[0].stall_cycles(), slow.sm[0].stall_cycles(), "round {round}");
+            assert_eq!((bulk.pad_out, bulk.pad_oe), (slow.pad_out, slow.pad_oe), "round {round}");
+        }
+        assert!(bulk.sm[0].stalled && bulk.sm[0].stall_cycles() > 100);
+        // Data arrives between quanta: both resume on the same cycle.
+        bulk.sm[0].tx_fifo.push(7);
+        slow.sm[0].tx_fifo.push(7);
+        bulk.step_n_with_pins(64, 0);
+        step_n(&mut slow, 64, 0);
+        assert_eq!((bulk.sm[0].x, bulk.sm[0].osr), (5, 7));
+        assert_eq!((slow.sm[0].x, slow.sm[0].osr), (5, 7));
+        assert_eq!(bulk.sm[0].clkdiv_acc, slow.sm[0].clkdiv_acc);
+        assert_eq!(bulk.sm[0].stall_cycles(), slow.sm[0].stall_cycles());
+    }
+
+    /// LOCAL PATCH 2026-11-23: a burst of activity inside one long
+    /// `step_n` call (loop: PULL; SET X; JMP back) re-enters the bulk path
+    /// once the SM stalls again and still matches per-cycle stepping.
+    #[test]
+    fn bulk_stall_resumes_after_burst_in_long_quantum() {
+        // 0: PULL block   1: SET X, 5   2: JMP 0
+        let prog = [0x80A0, 0xE025, 0x0000];
+        let (mut bulk, mut slow) = (make_pio_with_program(&prog), make_pio_with_program(&prog));
+        for round in 0..6 {
+            if round % 2 == 1 {
+                bulk.sm[0].tx_fifo.push(round);
+                slow.sm[0].tx_fifo.push(round);
+            }
+            bulk.step_n_with_pins(4096, 0);
+            step_n(&mut slow, 4096, 0);
+            assert_eq!(bulk.sm[0].pc, slow.sm[0].pc, "round {round}");
+            assert_eq!(bulk.sm[0].osr, slow.sm[0].osr, "round {round}");
+            assert_eq!(bulk.sm[0].x, slow.sm[0].x, "round {round}");
+            assert_eq!(bulk.sm[0].stalled, slow.sm[0].stalled, "round {round}");
+            assert_eq!(bulk.sm[0].stall_cycles(), slow.sm[0].stall_cycles(), "round {round}");
+            assert_eq!(bulk.sm[0].clkdiv_acc, slow.sm[0].clkdiv_acc, "round {round}");
+        }
     }
 
     #[test]

@@ -841,6 +841,19 @@ impl Emulator {
         if self.execution_model == ExecutionModel::Serial {
             let target = self.clock.cycles + cycles;
             while self.clock.cycles < target {
+                // LOCAL PATCH (deadline quanta): end the quantum on the exact
+                // cycle the next TIMER alarm matches (see Bus::deadline_quanta).
+                if self.bus.deadline_quanta && self.step_quantum > 1 {
+                    if let Some(n) = self.bus.sys_cycles_to_next_timer_alarm() {
+                        let full = self.step_quantum;
+                        if n < full as u64 {
+                            self.step_quantum = n.max(1) as u32;
+                            self.step_serial();
+                            self.step_quantum = full;
+                            continue;
+                        }
+                    }
+                }
                 self.step_serial();
             }
             return Ok(self.clock.cycles);
@@ -1438,16 +1451,27 @@ fn step_pair_arm(cs: &mut [CortexM33; 2], bus: &mut Bus, target: u64) {
             cs[core_id].ppb.merge_irq_pending(pending);
         }
 
-        while !cs[core_id].is_halted()
-            && !cs[core_id].is_wfe_waiting()
-            && cs[core_id].cycles < target
-        {
-            // Publish the core's cycle count into its PPB before each
-            // instruction so DWT_CYCCNT reads/writes land on a fresh
-            // value. Staleness is bounded by one instruction.
-            let cyc = cs[core_id].cycles;
-            cs[core_id].ppb.update_latest_cycles(cyc);
-            cs[core_id].step(bus);
+        // LOCAL PATCH (speed, 2026-11-23): the slice start merged pending
+        // IRQs above; the core re-polls only after its own bus accesses.
+        // Pure ops cannot sleep, write memory or assert IRQs, so the sleep
+        // re-check and invalidation drains below run only when
+        // step_serial says the op may have done one of those. The DWT
+        // cycle snapshot is refreshed on PPB access inside step_serial.
+        cs[core_id].irq_check_due = false;
+        cs[core_id].idle_slice_start();
+        let mut asleep = cs[core_id].is_halted() || cs[core_id].is_wfe_waiting();
+        while !asleep && cs[core_id].cycles < target {
+            let pc0 = cs[core_id].regs.pc();
+            let check = cs[core_id].step_serial(bus);
+            let pc1 = cs[core_id].regs.pc();
+            if pc1 < pc0 && cs[core_id].idle_skip {
+                // Backward branch: loop head. See CortexM33::idle_head_visit.
+                cs[core_id].idle_head_visit(pc1, target);
+            }
+            if !check {
+                continue;
+            }
+            asleep = cs[core_id].is_halted() || cs[core_id].is_wfe_waiting();
 
             // (c) Drain per-instruction cache-invalidation queue into
             // the core that just ran. Phase 3 follow-up #10 — the
@@ -1471,6 +1495,17 @@ fn step_pair_arm(cs: &mut [CortexM33; 2], bus: &mut Bus, target: u64) {
                 cs[1].invalidate_decode_cache_regions(regions);
                 bus.pending_invalidation_regions = 0;
             }
+        }
+        // LOCAL PATCH (AD9850 probe, 2026-11-23): time passes while a core
+        // sleeps. A halted (WFI / not yet launched) or WFE-waiting core
+        // used to keep its `cycles` frozen; on wake it then sat behind
+        // the master clock and ran a catch-up burst of instructions in
+        // zero emulated time with peripherals frozen (core1 launched at
+        // 2 s ran 2 s of code in its first quantum). Pull the sleeper up
+        // to the quantum target so it resumes in step with the clock and
+        // its SysTick keeps counting through the sleep.
+        if cs[core_id].cycles < target && (cs[core_id].is_halted() || cs[core_id].is_wfe_waiting()) {
+            cs[core_id].cycles = target;
         }
         // Final refresh so any post-quantum inspection (e.g. tests
         // reading DWT_CYCCNT between steps) sees a current base.
@@ -2736,9 +2771,71 @@ mod stage8_lib_residue {
         let mut emu = Emulator::new(Config::default());
         emu.bus.atomics.set_wfe_waiting(1);
         emu.bus.atomics.set_halted(0);
-        let pre = emu.cores.expect_arm()[1].cycles;
-        let _ = emu.step().unwrap();
-        assert_eq!(emu.cores.expect_arm()[1].cycles, pre);
+        let pre = emu.cores.expect_arm()[1].counters.decode_execute_cycles;
+        let now = emu.step().unwrap();
+        // Parked core executes nothing, but time passes: its cycle count
+        // follows the master clock (LOCAL PATCH 2026-11-23, see step_pair_arm).
+        assert_eq!(emu.cores.expect_arm()[1].counters.decode_execute_cycles, pre);
+        assert_eq!(emu.cores.expect_arm()[1].cycles, now);
+    }
+
+    /// LOCAL PATCH 2026-11-23 regression: a core that wakes after a long
+    /// halt resumes in step with the master clock instead of running a
+    /// catch-up burst of every cycle it slept through (which happened in
+    /// zero emulated time with peripherals frozen). Zeroed memory decodes
+    /// as `movs r0, r0`, so the woken core has something to execute.
+    #[test]
+    fn woken_core_does_not_run_catch_up_burst() {
+        let mut emu = Emulator::new(Config::default());
+        emu.bus.atomics.set_halted(0);
+        emu.bus.atomics.set_halted(1);
+        let q = emu.step_quantum as u64;
+        for _ in 0..10 {
+            emu.step().unwrap();
+        }
+        assert_eq!(emu.cores.expect_arm()[1].cycles, 10 * q);
+        emu.core_mut(1).wake();
+        let before = emu.cores.expect_arm()[1].counters.decode_execute_cycles;
+        emu.step().unwrap();
+        let ran = emu.cores.expect_arm()[1].counters.decode_execute_cycles - before;
+        // One quantum of work (plus at most one instruction's overshoot),
+        // not the 10 quanta it slept through.
+        assert!(ran >= 1 && ran < 2 * q, "woken core executed {ran} cycles in one {q}-cycle quantum");
+    }
+
+    /// LOCAL PATCH 2026-11-23: with `deadline_quanta`, a TIMER0 alarm
+    /// becomes pending on the same master cycle whatever the step quantum
+    /// is (and that cycle matches quantum 1, the exact reference).
+    #[test]
+    fn deadline_quanta_alarm_cycle_independent_of_quantum() {
+        let fire_cycle = |q: u32, deadline: bool| -> u64 {
+            let mut emu = Emulator::new(Config::default());
+            emu.bus.atomics.set_halted(0);
+            emu.bus.atomics.set_halted(1);
+            emu.bus.deadline_quanta = deadline;
+            emu.step_quantum = q;
+            // Release TIMER0 from reset and start its 1 us TICKS domain
+            // (what firmware / the bootrom normally do).
+            emu.mmio_write32(0x4002_3000, 1 << crate::bus::RESET_TIMER0);
+            emu.bus.ticks.domains[crate::peripherals::ticks::DOMAIN_TIMER0].enable = true;
+            // TIMER0: INTE alarm0, ALARM0 = now + 37 us (arms it).
+            emu.mmio_write32(0x400B_0040, 1);
+            let now = emu.mmio_read32(0x400B_0028);
+            emu.mmio_write32(0x400B_0010, now.wrapping_add(37));
+            loop {
+                emu.run(1).unwrap(); // one (deadline-adjusted) quantum
+                if emu.bus.atomics.irq_pending_load(0) & 1 != 0 {
+                    return emu.cycles();
+                }
+                assert!(emu.cycles() < 100_000_000, "alarm never fired");
+            }
+        };
+        let exact = fire_cycle(1, false);
+        for q in [64u32, 256, 1000, 4096] {
+            assert_eq!(fire_cycle(q, true), exact, "quantum {q} with deadline quanta");
+        }
+        // Without it, a large quantum fires late (sanity check of the test).
+        assert!(fire_cycle(4096, false) > exact);
     }
 
     // ------------------- core_riscv accessor on RiscV emulator -------------------

@@ -11,6 +11,7 @@ pub const XPSR_T: u32 = 1 << 24;
 /// Layout is `repr(C)` for cache locality. The entire struct fits in 4 cache
 /// lines (232 bytes < 256).
 #[repr(C)]
+#[derive(Clone)] // LOCAL PATCH (speed): idle-loop snapshot
 pub struct Registers {
     /// R0-R12, SP (R13), LR (R14), PC (R15).
     pub r: [u32; 16],

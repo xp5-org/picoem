@@ -165,7 +165,8 @@ fn threaded_uart_str_loop() {
     seed_str_loop_to_addr(&mut emu, UART0_DR, 0x55);
     let (c0, c1) = run_n_quanta(&mut emu, QUANTA_PER_TEST);
     assert!(c0 > 0, "UART STR loop must advance core 0");
-    assert_eq!(c1, 0, "core 1 halted");
+    // LOCAL PATCH (2026-11-23): a halted core's cycles follow the master clock.
+    assert_eq!(c1, QUANTA_PER_TEST as u64 * emu.step_quantum as u64, "halted core 1 follows the clock");
 }
 
 /// Drives **SPI0**. Loop writes SSPCR0/SSPCR1 in alternation. Targets

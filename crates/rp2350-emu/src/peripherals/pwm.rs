@@ -351,7 +351,9 @@ impl PwmRegs {
     /// convert sys_clk ticks into counter advances via an O(1)
     /// closed-form fractional accumulator.
     pub fn tick(&mut self, cycles: u32, _clock_tree: &ClockTree, irqs: &mut u64) {
-        if cycles == 0 {
+        // LOCAL PATCH (speed, 2026-11-23): no slice enabled -> the loop below
+        // advances nothing; skip straight to IRQ routing (same end state).
+        if cycles == 0 || self.en == 0 {
             self.route_irq(irqs);
             return;
         }

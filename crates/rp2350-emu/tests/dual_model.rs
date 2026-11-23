@@ -679,7 +679,11 @@ fn halted_cores_report_zero_on_both_models() {
         "Halted-cores delta must match across models: serial={:?}, threaded={:?}",
         results[0], results[1],
     );
-    assert_eq!(results[0], (0, 0), "halted cores must not advance");
+    // LOCAL PATCH (2026-11-23): time passes while a core is halted, so a
+    // halted core's cycle count follows the master clock (it used to stay
+    // frozen and then run a catch-up burst on wake). Both cores track it.
+    assert_eq!(results[0].0, results[0].1, "both halted cores track the clock");
+    assert!(results[0].0 >= RUN_CYCLES, "halted cores follow the master clock: {:?}", results[0]);
 }
 
 // ---------------------------------------------------------------------------

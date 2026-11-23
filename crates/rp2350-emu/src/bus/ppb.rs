@@ -662,6 +662,18 @@ impl Ppb {
     /// M33 step path before instruction fetch; the caller then compares
     /// the returned exception's priority against `execution_priority`
     /// to decide whether to preempt.
+    /// LOCAL PATCH (speed, 2026-11-23): cheap gate in front of
+    /// `try_take_any_pending_exception`. False only when that function
+    /// would certainly return `None`: no NMI / PendSV / SysTick pend bit
+    /// in ICSR and no NVIC line both enabled and pending.
+    #[inline(always)]
+    pub(crate) fn exception_may_be_pending(&self) -> bool {
+        (self.icsr & (ICSR_NMIPENDSET | ICSR_PENDSVSET | ICSR_PENDSTSET)) != 0
+            || ((self.nvic_iser[0].load(Ordering::Relaxed) & self.nvic_ispr[0].load(Ordering::Relaxed))
+                | (self.nvic_iser[1].load(Ordering::Relaxed) & self.nvic_ispr[1].load(Ordering::Relaxed)))
+                != 0
+    }
+
     pub(crate) fn highest_priority_pending_irq(&self) -> Option<u16> {
         let mut best: Option<(i16, u16)> = None;
         for word_idx in 0..NVIC_BIT_WORDS {

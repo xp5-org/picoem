@@ -574,6 +574,38 @@ impl CortexM33 {
             return self.thumb32_undefined(hw0, hw1, bus);
         }
 
+        // Two-register transfers (MCRR/MRRC): hw0 = 1110_1100_010L_Rt2.
+        //   cp10: VMOV Sm, Sm1, Rt, Rt2 / VMOV Rt, Rt2, Sm, Sm1
+        //   cp11: VMOV Dm, Rt, Rt2      / VMOV Rt, Rt2, Dm     (legal on FPv5-SP-D16;
+        //         clang moves soft-double operands to the __aeabi_* helpers this way)
+        // Dm is the pair (s[2m], s[2m+1]), low word first, as in VLDR/VSTR .64.
+        if hw0 & 0xFFE0 == 0xEC40 {
+            let l = (hw0 >> 4) & 1;
+            let rt2 = (hw0 & 0xF) as usize;
+            let rt = ((hw1 >> 12) & 0xF) as usize;
+            let m = ((hw1 >> 5) & 1) as usize;
+            let vm = (hw1 & 0xF) as usize;
+            let first = if dp { ((m << 4) | vm) << 1 } else { (vm << 1) | m };
+            if rt == 15 || rt2 == 15 || (l != 0 && rt == rt2) || (!dp && first + 1 > 31) {
+                return self.thumb32_undefined(hw0, hw1, bus);
+            }
+            if self.ppb.fpccr & crate::bus::ppb::FPCCR_LSPACT != 0 {
+                if self.flush_lazy_fp_context(bus).is_err() {
+                    return 0;
+                }
+                self.ppb.fpccr &= !crate::bus::ppb::FPCCR_LSPACT;
+            }
+            self.regs.control |= crate::core::exceptions::CONTROL_FPCA;
+            if l == 0 {
+                self.regs.s[first] = f32::from_bits(self.regs.r[rt]);
+                self.regs.s[first + 1] = f32::from_bits(self.regs.r[rt2]);
+            } else {
+                self.regs.r[rt] = self.regs.s[first].to_bits();
+                self.regs.r[rt2] = self.regs.s[first + 1].to_bits();
+            }
+            return 1;
+        }
+
         // Phase 7 Stage B: lazy FP context flush. If a prior exception
         // entry deferred the FP register write (FPCCR.LSPACT=1), flush
         // S0-S15 + FPSCR to the reserved frame *before* the first in-
@@ -634,9 +666,10 @@ impl CortexM33 {
     //   hw0[7]=1  → VMAXNM/VMINNM (hw1[6]=op: 0=max, 1=min; hw0[6:5]=00)
 
     fn fpu_v8m_dp(&mut self, hw0: u16, hw1: u16) -> u32 {
-        // The 0xFE family encodes D at hw0[4].
+        // The 0xFE family encodes D at hw0[6] (DDI0553: VSEL = 111111100 D cc Vn,
+        // VMAXNM/VMINNM = 111111101 D 00 Vn), so cc / the zero field are hw0[5:4].
         let vd = ((hw1 >> 12) & 0xF) as usize;
-        let d = ((hw0 >> 4) & 1) as usize;
+        let d = ((hw0 >> 6) & 1) as usize;
         let sd = (vd << 1) | d;
         let vn = (hw0 & 0xF) as usize;
         let n = ((hw1 >> 7) & 1) as usize;
@@ -644,8 +677,8 @@ impl CortexM33 {
         let sm = vfp_sm(hw1);
 
         if hw0 & 0x80 == 0 {
-            // VSEL<cc>.F32 — hw0[6:5] = cc: 00=EQ, 01=VS, 10=GE, 11=GT
-            let cc = (hw0 >> 5) & 0x3;
+            // VSEL<cc>.F32 — hw0[5:4] = cc: 00=EQ, 01=VS, 10=GE, 11=GT
+            let cc = (hw0 >> 4) & 0x3;
             let take_sn = self.vsel_condition_holds(cc);
             self.regs.s[sd] = if take_sn {
                 self.regs.s[sn]
@@ -653,7 +686,7 @@ impl CortexM33 {
                 self.regs.s[sm]
             };
             1
-        } else if (hw0 >> 5) & 0x3 == 0 {
+        } else if (hw0 >> 4) & 0x3 == 0 {
             // VMAXNM / VMINNM
             //
             // Per DDI0553 §D1.2.88: these set IOC when either input is a

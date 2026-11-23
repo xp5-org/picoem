@@ -85,6 +85,13 @@ impl DecodedOp {
     pub(crate) const FLAG_WIDE: u8 = 0b0000_0001;
     pub(crate) const FLAG_PURE: u8 = 0b0000_0010;
     pub(crate) const FLAG_FLAG_ONLY: u8 = 0b0000_0100;
+    /// LOCAL PATCH (speed): BKPT or a hint (WFE / WFI / SEV / YIELD / NOP):
+    /// a pure op that may halt or park its own core.
+    pub(crate) const FLAG_SLEEPY: u8 = 0b0000_1000;
+    /// LOCAL PATCH (speed): a plain load encoding (no store, no coprocessor,
+    /// no exception return). Lets the idle-loop detector accept impure ops
+    /// that only read; the read wrapper still vets each address.
+    pub(crate) const FLAG_IDLE_LOAD: u8 = 0b0001_0000;
 
     #[inline(always)]
     pub(crate) fn empty() -> Self {
@@ -110,6 +117,16 @@ impl DecodedOp {
     #[inline(always)]
     pub(crate) fn is_flag_only(&self) -> bool {
         self.flags & Self::FLAG_FLAG_ONLY != 0
+    }
+
+    #[inline(always)]
+    pub(crate) fn is_sleepy(&self) -> bool {
+        self.flags & Self::FLAG_SLEEPY != 0
+    }
+
+    #[inline(always)]
+    pub(crate) fn is_idle_load(&self) -> bool {
+        self.flags & Self::FLAG_IDLE_LOAD != 0
     }
 }
 
@@ -520,6 +537,19 @@ pub struct Bus {
     /// evicted along with the narrow slot. Parity with the pre-migration
     /// `Bus::invalidate_pc_range` which cleared `{addr-2, addr [, addr+2]}`.
     pub pending_cache_invalidations: Vec<u32>,
+    /// LOCAL PATCH (speed, 2026-11-23): one bit per 256-byte page of main
+    /// SRAM (0x2000_0000..0x2008_2000) that has ever had an instruction
+    /// fetched into a decode cache. A store to a page with no fetched code
+    /// cannot hit a cached instruction, so `invalidate_pc_range` skips
+    /// queueing it (it would only evict unrelated slots that alias).
+    /// Bits are never cleared (conservative).
+    pub(crate) code_pages: [u64; 33],
+    /// LOCAL PATCH (deadline quanta, 2026-11-23): when true, `Emulator::run`
+    /// (Serial) shortens a quantum so it ends exactly when the next armed
+    /// TIMER0/1 alarm matches. Alarm IRQs then land on their exact cycle
+    /// whatever `step_quantum` is, so large quanta (fast) keep exact alarm
+    /// timing. Default off (upstream behaviour).
+    pub deadline_quanta: bool,
     /// Region-scoped bulk-invalidation bitmask. Set by [`Self::load_bootrom`]
     /// (bit [`invalidation_regions::ROM`]), [`Self::load_flash`] (bit
     /// [`invalidation_regions::XIP`]), and [`Self::invalidate_all`] (bit
@@ -664,6 +694,8 @@ impl Bus {
             // front — STM tops out at 13 registers, FPU context push
             // spills 16 words. Matches `WorkerBus::pending_cache_invalidations`.
             pending_cache_invalidations: Vec::with_capacity(16),
+            code_pages: [0; 33],
+            deadline_quanta: false,
             pending_invalidation_regions: 0,
             mmio_trace_enabled: false,
             active_pc: [0; 2],
@@ -1122,6 +1154,34 @@ impl Bus {
     /// V5 does NOT gate this call — the prompt is explicit: "tick
     /// every cycle, unconditionally. A follow-up HLD will add a gate
     /// if `paced_bench_rp2350` regression exceeds the §9.8 threshold."
+    /// LOCAL PATCH (deadline quanta, 2026-11-23): sys cycles until the next
+    /// armed TIMER0/1 alarm matches, mirroring the clk_ref conversion and
+    /// TICKS divider in `tick_peripherals` exactly. `None` if no alarm is
+    /// armed (or its clock is stopped).
+    pub(crate) fn sys_cycles_to_next_timer_alarm(&self) -> Option<u64> {
+        let sys_hz = self.clock_tree.sys_clk_hz.max(1) as u64;
+        let ref_hz = self.clock_tree.ref_clk_hz as u64;
+        if ref_hz == 0 {
+            return None;
+        }
+        let mut best: Option<u64> = None;
+        for (timer, bit, dom) in [
+            (&self.timer0, RESET_TIMER0, crate::peripherals::ticks::DOMAIN_TIMER0),
+            (&self.timer1, RESET_TIMER1, crate::peripherals::ticks::DOMAIN_TIMER1),
+        ] {
+            if self.is_held_in_reset_bit(bit) {
+                continue;
+            }
+            let Some(e) = timer.edges_to_next_alarm() else { continue };
+            let Some(r) = self.ticks.domains[dom].ref_cycles_until_edges(e) else { continue };
+            // smallest n with floor((ref_frac + n*ref_hz) / sys_hz) >= r
+            let need = (r * sys_hz).saturating_sub(self.ticks.ref_frac);
+            let n = need.div_ceil(ref_hz);
+            best = Some(best.map_or(n, |b| b.min(n)));
+        }
+        best
+    }
+
     pub(crate) fn tick_peripherals(&mut self, sys_clks: u32) {
         // TICKS runs unconditionally — there is no RESETS bit for the
         // tick generator (it is bus-level plumbing). Advance all six
@@ -1131,9 +1191,22 @@ impl Bus {
         // sys clock the TIMER ran 12.5x fast. Convert sys cycles -> ref cycles.
         let sys_hz = self.clock_tree.sys_clk_hz.max(1) as u64;
         let ref_hz = self.clock_tree.ref_clk_hz as u64;
-        let acc = self.ticks.ref_frac + (sys_clks as u64) * ref_hz;
-        let ref_cycles = (acc / sys_hz) as u32;
-        self.ticks.ref_frac = acc % sys_hz;
+        let mut acc = self.ticks.ref_frac + (sys_clks as u64) * ref_hz;
+        // Subtract rather than divide for the usual small quantum (ref is
+        // 12 MHz vs 150 MHz sys: ~5 ref cycles per 64 sys); same result.
+        let ref_cycles = if acc < 8 * sys_hz {
+            let mut n = 0u32;
+            while acc >= sys_hz {
+                acc -= sys_hz;
+                n += 1;
+            }
+            n
+        } else {
+            let n = (acc / sys_hz) as u32;
+            acc %= sys_hz;
+            n
+        };
+        self.ticks.ref_frac = acc;
         self.ticks.advance_all(ref_cycles);
 
         // MTIME (SIO §3.1.8) — drain RISCV TICKS edges and advance the
@@ -1473,9 +1546,47 @@ impl Bus {
     /// a 4-byte write we push `{addr, addr+2}` so the combined coverage
     /// is `{addr-2, addr, addr+2}` — parity with the pre-migration
     /// `invalidate_pc_range(addr, 4)` sweep.
+    /// Physical main-SRAM page of `addr` (any atomic alias, and the
+    /// RISC-V oracle's 0x8 mirror, map to the same page as the decode
+    /// cache's slot index does), or `None` outside main SRAM.
+    #[inline(always)]
+    fn sram_code_page(addr: u32) -> Option<usize> {
+        let a = canon_oracle_addr(addr);
+        if a >> 28 != 0x2 {
+            return None;
+        }
+        let off = a & 0x00FF_FFFF;
+        if off < 0x8_2000 { Some((off >> 8) as usize) } else { None }
+    }
+
+    /// Record that `pc` (and a possible second halfword) was fetched into
+    /// a decode cache. See [`Self::code_pages`].
     #[inline]
+    pub(crate) fn note_code_fetch(&mut self, pc: u32) {
+        for a in [pc, pc.wrapping_add(3)] {
+            if let Some(p) = Self::sram_code_page(a) {
+                self.code_pages[p >> 6] |= 1u64 << (p & 63);
+            }
+        }
+    }
+
+    #[inline(always)]
+    fn code_page_noted(&self, p: usize) -> bool {
+        self.code_pages[p >> 6] & (1u64 << (p & 63)) != 0
+    }
+
     fn invalidate_pc_range(&mut self, addr: u32, len: u8) {
         debug_assert!(len == 1 || len == 2 || len == 4);
+        // Affected decode slots cover addr-2 .. addr+len-1. If that whole
+        // span is main SRAM with no fetched code, nothing cached can match.
+        if let (Some(p0), Some(p1)) = (
+            Self::sram_code_page(addr.wrapping_sub(2)),
+            Self::sram_code_page(addr.wrapping_add(len as u32 - 1)),
+        ) {
+            if !self.code_page_noted(p0) && !self.code_page_noted(p1) {
+                return;
+            }
+        }
         if matches!(addr >> 28, 0x0..=0x2) {
             self.pending_cache_invalidations.push(addr);
             if len == 4 {
@@ -3506,6 +3617,11 @@ impl CoreBus for Bus {
     #[inline(always)]
     fn set_active_pc(&mut self, pc: u32, core: u8) {
         Bus::set_active_pc(self, pc, core)
+    }
+
+    #[inline(always)]
+    fn note_code_fetch(&mut self, pc: u32) {
+        Bus::note_code_fetch(self, pc)
     }
 
     #[inline(always)]
