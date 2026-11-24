@@ -725,7 +725,7 @@ impl Emulator {
             self.clock.cycles = self.clock.cycles.wrapping_add(c0.max(c1));
         }
 
-        let consumed = self.clock.cycles.wrapping_sub(start);
+        let mut consumed = self.clock.cycles.wrapping_sub(start);
         // tech_debt §1649: when both cores are blocked (halted-or-WFE)
         // and the inner loop made no progress, `consumed == 0` and
         // neither the fast-path nor the slow-path below would advance
@@ -750,14 +750,29 @@ impl Emulator {
             // farther out, the caller's `run`/`run_quantum` loop iterates
             // and the next `step()` re-enters this branch, closing the
             // gap across multiple quanta — never silently stalls.
+            // The advance runs through the same peripheral paths as
+            // executed cycles, so PIO and DMA keep streaming while both
+            // cores sleep.
             let max_advance = self.step_quantum as u64;
-            let advance = (deadline - self.bus.master_cycle).min(max_advance);
-            self.clock.cycles = self.clock.cycles.wrapping_add(advance);
-            self.bus.master_cycle = self.clock.cycles;
-            self.bus.tick_peripherals(advance as u32);
-            self.drain_pending_irqs_to_cores();
-            self.wake_checks();
-            return advance;
+            consumed = (deadline - self.bus.master_cycle).min(max_advance);
+            self.clock.cycles = self.clock.cycles.wrapping_add(consumed);
+        }
+        // Both cores blocked with no alarm to skip to: a core parked in
+        // WFE, or PIO and DMA still moving data, means time goes on, so
+        // the quantum passes as idle cycles through the peripheral paths
+        // below. Cores halted for good, with nothing running, still stop
+        // the clock and `run` returns early.
+        if consumed == 0
+            && (self.cores[0].is_halted() || self.bus.wfe_waiting[0])
+            && (self.cores[1].is_halted() || self.bus.wfe_waiting[1])
+            && self.bus.irq_pending == 0
+            && (self.bus.wfe_waiting[0]
+                || self.bus.wfe_waiting[1]
+                || !self.bus.pio_all_idle()
+                || !self.bus.dma.is_idle())
+        {
+            consumed = self.step_quantum as u64;
+            self.clock.cycles = self.clock.cycles.wrapping_add(consumed);
         }
         // See the fn docstring for the rationale on the fast-path and
         // the per-cycle interleave. Measured impact of the fast-path
@@ -1270,6 +1285,7 @@ impl Emulator {
     /// cannot produce a pending_launch. Kept for call-site-compatibility
     /// with the replaced placeholder.
     fn maybe_wake_core1(&mut self, _writer_core: usize) {
+        self.apply_core1_psm_reset();
         let Some(launch) = self.bus.sio.take_pending_launch() else {
             return;
         };
@@ -1291,6 +1307,25 @@ impl Emulator {
         self.cores[1].reset_control_for_launch();
         self.bus.event_flag[1] = false; // clear any stale wake signal
         self.wake_core1();
+    }
+
+    /// Apply a PSM FRCE_OFF.PROC1 edge to core 1. Forced off, core 1
+    /// halts. Released, it starts in the bootrom's core 1 wait loop, which
+    /// sends a 0 to core 0 through the FIFO, with an event, and then waits
+    /// for the launch sequence; the handshake FSM stands in for that loop.
+    fn apply_core1_psm_reset(&mut self) {
+        let Some(held) = self.bus.core1_psm_reset.take() else {
+            return;
+        };
+        self.halt_core1();
+        self.bus.wfe_waiting[1] = false;
+        self.bus.event_flag[1] = false;
+        if !held {
+            self.bus.sio.write32(0x054, 0, 1);
+            if let Some(receiver) = self.bus.sio.pending_fifo_event.take() {
+                self.bus.event_flag[receiver] = true;
+            }
+        }
     }
 
     /// Read a GPIO pin from the merged pin state. Debug-only: asserts
@@ -1416,6 +1451,14 @@ impl Emulator {
     pub fn drain_uart0_tx_log(&mut self) -> Vec<u8> {
         self.assert_not_placeholder();
         self.bus.drain_uart0_tx_log()
+    }
+
+    /// Harness-only: deliver one byte to UART0's receiver as if it had
+    /// arrived on the RX pin. False when the receiver is off or its FIFO
+    /// is full, and the byte was dropped.
+    pub fn uart0_push_rx(&mut self, byte: u8) -> bool {
+        self.assert_not_placeholder();
+        self.bus.uart0_push_rx(byte)
     }
 }
 

@@ -231,6 +231,20 @@ impl UartRegs {
         *self = Self::new(irq);
     }
 
+    /// Deliver one byte from the far end of the wire into the RX FIFO.
+    /// Returns false when the FIFO is full, or the receiver is disabled,
+    /// and the byte is dropped as an overrun would drop it.
+    pub fn push_rx(&mut self, byte: u8, irqs: &mut u32) -> bool {
+        let cap = self.tx_capacity();
+        if !self.is_enabled() || (self.cr & UARTCR_RXE) == 0 || self.rx_fifo.len() >= cap {
+            return false;
+        }
+        self.rx_fifo.push_back(byte);
+        self.refresh_rx_interrupt();
+        self.route_irq(irqs);
+        true
+    }
+
     /// True iff the UART has no outstanding work (TX FIFO drained, RX
     /// FIFO empty). Used by `Bus::all_peripherals_idle` to keep the
     /// fast-path taken whenever firmware isn't actively transmitting.
@@ -328,8 +342,7 @@ impl UartRegs {
     /// Recompute `ris` from the live state. TX interrupt latches when
     /// the FIFO level drops to at or below the configured trigger level.
     /// RX interrupt latches when FIFO level rises above the threshold.
-    ///
-    /// Phase 2 only models TX. RX path is deferred.
+    /// The RX side is `refresh_rx_interrupt`.
     fn refresh_tx_interrupt(&mut self) {
         let lvl = self.tx_fifo.len();
         let thresh = self.tx_fill_threshold();
@@ -513,7 +526,39 @@ impl UartRegs {
     /// otherwise return 0. Side-effect: clears the RX path's error
     /// flags in the low nibble of RSR (not modelled in Phase 2).
     fn read_dr(&mut self) -> u8 {
-        self.rx_fifo.pop_front().unwrap_or(0)
+        let b = self.rx_fifo.pop_front().unwrap_or(0);
+        self.refresh_rx_interrupt();
+        b
+    }
+
+    /// RXIFLSEL bits [5:3] as the fill level that raises the RX interrupt.
+    fn rx_fill_threshold(&self) -> usize {
+        match (self.ifls >> 3) & 0x7 {
+            0 => UART_FIFO_DEPTH / 8,
+            1 => UART_FIFO_DEPTH / 4,
+            3 => (UART_FIFO_DEPTH * 3) / 4,
+            4 => (UART_FIFO_DEPTH * 7) / 8,
+            _ => UART_FIFO_DEPTH / 2,
+        }
+    }
+
+    /// RX is level based here: RX is set while the FIFO holds the trigger
+    /// level, and RT while it holds anything at all. Silicon raises RT
+    /// only after 32 idle bit times, which a harness feeding whole bytes
+    /// has no use for. Both clear once the FIFO is drained below them.
+    fn refresh_rx_interrupt(&mut self) {
+        let lvl = self.rx_fifo.len();
+        let thresh = if self.fifos_enabled() { self.rx_fill_threshold() } else { 1 };
+        if lvl >= thresh.max(1) {
+            self.ris |= UART_INT_RX;
+        } else {
+            self.ris &= !UART_INT_RX;
+        }
+        if lvl > 0 {
+            self.ris |= UART_INT_RT;
+        } else {
+            self.ris &= !UART_INT_RT;
+        }
     }
 
     /// Push a byte into the TX FIFO. If the UART is disabled or

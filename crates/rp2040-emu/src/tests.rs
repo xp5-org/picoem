@@ -7167,24 +7167,39 @@ mod stage7_sio_coverage {
 
     // --- Divider result-read dirty transitions ----------------------------
 
-    /// `divider_result_read` must clear the `dirty` flag only after two
-    /// reads (lines 559-564 drain branches). Exercises both the "first
-    /// read leaves dirty" and "second read clears dirty" arms, plus the
-    /// not-dirty path on a third read.
+    /// DIV_CSR.DIRTY clears on a QUOTIENT read and not on a REMAINDER
+    /// read, so a quotient-only divide such as `__aeabi_idiv` leaves the
+    /// divider clean for the next one.
     #[test]
-    fn divider_dirty_flag_clears_after_two_reads() {
+    fn divider_dirty_flag_clears_on_quotient_read() {
         let mut sio = Sio::new();
         sio.write32(0x060, 100, 0);
         sio.write32(0x064, 7, 0);
         // CSR (0x078): ready|dirty → 3.
         assert_eq!(sio.read32(0x078, 0) & 0x3, 0x3);
-        let _ = sio.read32(0x070, 0); // first quotient read → reads_pending=1
-        let _ = sio.read32(0x074, 0); // second result read → clears dirty
-        // CSR: ready only.
+        let _ = sio.read32(0x074, 0); // remainder read leaves dirty
+        assert_eq!(sio.read32(0x078, 0) & 0x3, 0x3);
+        assert_eq!(sio.read32(0x070, 0), 14); // quotient read clears it
         assert_eq!(sio.read32(0x078, 0) & 0x3, 0x1);
-        // Third read now hits the `!dirty` branch (line 565 false arm).
-        let _ = sio.read32(0x070, 0);
+        sio.write32(0x068, (-9i32) as u32, 0);
+        sio.write32(0x06C, 2, 0);
+        assert_eq!(sio.read32(0x070, 0), (-4i32) as u32); // quotient only
         assert_eq!(sio.read32(0x078, 0) & 0x3, 0x1);
+    }
+
+    /// A DIVIDEND write after the DIVISOR starts a new calculation, as the
+    /// SDK's 64-bit divide does when it writes the divisor first.
+    #[test]
+    fn divider_dividend_write_recomputes() {
+        let mut sio = Sio::new();
+        sio.write32(0x064, 7, 0); // UDIVISOR
+        sio.write32(0x060, 100, 0); // UDIVIDEND
+        assert_eq!(sio.read32(0x074, 0), 2);
+        assert_eq!(sio.read32(0x070, 0), 14);
+        sio.write32(0x06C, 3, 0); // SDIVISOR
+        sio.write32(0x068, (-10i32) as u32, 0); // SDIVIDEND
+        assert_eq!(sio.read32(0x074, 0), (-1i32) as u32);
+        assert_eq!(sio.read32(0x070, 0), (-3i32) as u32);
     }
 
     /// Direct write to result register (0x070/0x074) sets dirty (lines
@@ -9073,8 +9088,9 @@ mod wfe_sev_tests {
     }
 
     /// Test 12: With both cores WFE-blocked, one step quantum
-    /// terminates cleanly without panic or infinite loop. Both cores
-    /// charge zero cycles.
+    /// terminates cleanly without panic or infinite loop. Time goes on
+    /// while they sleep, so the quantum passes as idle cycles, and
+    /// neither core charges any.
     #[test]
     fn both_cores_wfe_blocked_quantum_breaks_cleanly() {
         let mut emu = EmulatorBuilder::new(Config::default())
@@ -9089,9 +9105,41 @@ mod wfe_sev_tests {
         let c0_before = emu.cores[0].cycles;
         let c1_before = emu.cores[1].cycles;
         let consumed = emu.step().expect("Serial step is infallible");
-        assert_eq!(consumed, 0, "both blocked → no cycles consumed");
+        assert_eq!(consumed, 8, "both blocked: the quantum passes idle");
         assert_eq!(emu.cores[0].cycles, c0_before);
         assert_eq!(emu.cores[1].cycles, c1_before);
+    }
+
+    /// Both cores halted with nothing running: the clock stops and the
+    /// quantum consumes nothing, so `run` returns early.
+    #[test]
+    fn both_cores_halted_and_idle_consumes_nothing() {
+        let mut emu = EmulatorBuilder::new(Config::default())
+            .step_quantum(8)
+            .build()
+            .expect("Serial build is infallible");
+        emu.cores[0].halt();
+        emu.halt_core1();
+        assert_eq!(emu.step().expect("Serial step is infallible"), 0);
+    }
+
+    /// PSM FRCE_OFF.PROC1 set then cleared, as `multicore_reset_core1`
+    /// does: core 1 stays halted with the launch FSM armed, and the
+    /// bootrom's core 1 start sends a 0 to core 0 with an event.
+    #[test]
+    fn psm_proc1_reset_sends_bootrom_zero() {
+        let mut emu = EmulatorBuilder::new(Config::default()).build().expect("Serial build is infallible");
+        emu.wake_core1();
+        emu.bus.write32(0x4001_2004, 1 << 16); // FRCE_OFF set alias
+        emu.apply_core1_psm_reset();
+        assert!(emu.cores[1].is_halted());
+        assert!(emu.bus.sio.fifo_1to0_snapshot().is_empty());
+        emu.bus.write32(0x4001_3004, 1 << 16); // FRCE_OFF clear alias
+        emu.apply_core1_psm_reset();
+        assert!(emu.cores[1].is_halted());
+        assert!(emu.bus.sio.is_handshake_armed());
+        assert_eq!(emu.bus.sio.fifo_1to0_snapshot(), vec![0]);
+        assert!(emu.bus.event_flag[0]);
     }
 }
 

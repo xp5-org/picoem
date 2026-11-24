@@ -43,6 +43,9 @@ pub struct CoreAtomics {
     /// `rcp_count_set` initialises; [`Self::rcp_count_check`] asserts
     /// counter == expected then increments (CAS loop).
     pub rcp_count: AtomicU32,
+    /// Per-core state of the PRNG behind `rcp_random_byte`, seeded from
+    /// the salt on first use.
+    pub rcp_rng: [AtomicU32; 2],
     /// Per-core precise bus-fault flag. Observed by `CortexM33::step`
     /// after a data-side access; escalated to BusFault/HardFault.
     pub bus_fault: [AtomicBool; 2],
@@ -60,6 +63,7 @@ impl Default for CoreAtomics {
             rcp_salt: [AtomicU32::new(0), AtomicU32::new(0)],
             rcp_salt_valid: [AtomicBool::new(false), AtomicBool::new(false)],
             rcp_count: AtomicU32::new(0),
+            rcp_rng: [AtomicU32::new(0), AtomicU32::new(0)],
             bus_fault: [AtomicBool::new(false), AtomicBool::new(false)],
             bus_fault_addr: [AtomicU32::new(0), AtomicU32::new(0)],
         }
@@ -228,6 +232,24 @@ impl CoreAtomics {
     }
 
     #[inline]
+    /// Step core `core`'s RCP PRNG and return its next byte. Silicon draws
+    /// it from the upper salt bits; any well-mixed byte serves the bootrom,
+    /// which uses it only for random delays and must see a value 0..=255.
+    pub fn rcp_random_byte(&self, core: usize) -> u8 {
+        let mut x = self.rcp_rng[core].load(Ordering::Relaxed);
+        if x == 0 {
+            x = self.rcp_salt_load(core) ^ 0x9E37_79B9;
+            if x == 0 {
+                x = 0x9E37_79B9;
+            }
+        }
+        x ^= x << 13;
+        x ^= x >> 17;
+        x ^= x << 5;
+        self.rcp_rng[core].store(x, Ordering::Relaxed);
+        (x >> 24) as u8
+    }
+
     pub fn rcp_salt_load(&self, core: usize) -> u32 {
         self.rcp_salt[core].load(Ordering::Acquire)
     }

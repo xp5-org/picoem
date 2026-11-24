@@ -162,6 +162,9 @@ pub struct UartRegs {
     dreq_tx: u8,
     /// DREQ index for RX FIFO not-empty.
     dreq_rx: u8,
+    /// Every byte that has left the TX FIFO onto the wire, for the
+    /// harness to read with `drain_tx_log`. Invisible to guest software.
+    tx_wire_log: Vec<u8>,
 }
 
 impl UartRegs {
@@ -187,15 +190,38 @@ impl UartRegs {
             nvic_irq,
             dreq_tx,
             dreq_rx,
+            tx_wire_log: Vec::new(),
         }
     }
 
-    /// Reset every field to post-init defaults.
+    /// Reset every field to post-init defaults. The harness-side TX log
+    /// survives, so output written before a watchdog reboot is kept.
     pub fn reset(&mut self) {
         let irq = self.nvic_irq;
         let dtx = self.dreq_tx;
         let drx = self.dreq_rx;
+        let log = std::mem::take(&mut self.tx_wire_log);
         *self = Self::new(irq, dtx, drx);
+        self.tx_wire_log = log;
+    }
+
+    /// Take every byte transmitted since the last call. Harness only.
+    pub fn drain_tx_log(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.tx_wire_log)
+    }
+
+    /// Deliver one byte from the far end of the wire into the RX FIFO.
+    /// Returns false when the FIFO is full, or the receiver is disabled,
+    /// and the byte is dropped as an overrun would drop it.
+    pub fn push_rx(&mut self, byte: u8, irqs: &mut u64) -> bool {
+        let cap = if self.fifos_enabled() { UART_FIFO_DEPTH } else { 1 };
+        if (self.cr & UARTCR_RXE) == 0 || (self.cr & UARTCR_UARTEN) == 0 || self.rx_fifo.len() >= cap {
+            return false;
+        }
+        self.rx_fifo.push_back(byte);
+        self.refresh_rx_interrupt();
+        self.route_irq(irqs);
+        true
     }
 
     /// DREQ index for TX FIFO (consumed by the DMA matrix).
@@ -458,7 +484,31 @@ impl UartRegs {
     /// Read UARTDR. If the RX FIFO has data, pop the head byte;
     /// otherwise return 0.
     fn read_dr(&mut self) -> u8 {
-        self.rx_fifo.pop_front().unwrap_or(0)
+        let b = self.rx_fifo.pop_front().unwrap_or(0);
+        self.refresh_rx_interrupt();
+        b
+    }
+
+    /// RXIFLSEL bits [5:3] as the fill level that raises the RX interrupt.
+    fn rx_fill_threshold(&self) -> usize {
+        match (self.ifls >> 3) & 0x7 {
+            0 => UART_FIFO_DEPTH / 8,
+            1 => UART_FIFO_DEPTH / 4,
+            3 => (UART_FIFO_DEPTH * 3) / 4,
+            4 => (UART_FIFO_DEPTH * 7) / 8,
+            _ => UART_FIFO_DEPTH / 2,
+        }
+    }
+
+    /// RX is level based here: RX is set while the FIFO holds the trigger
+    /// level, and RT while it holds anything at all. Silicon raises RT
+    /// only after 32 idle bit times, which a harness feeding whole bytes
+    /// has no use for. Both clear once the FIFO is drained below them.
+    fn refresh_rx_interrupt(&mut self) {
+        let lvl = self.rx_fifo.len();
+        let thresh = if self.fifos_enabled() { self.rx_fill_threshold() } else { 1 };
+        if lvl >= thresh.max(1) { self.ris |= UART_INT_RX; } else { self.ris &= !UART_INT_RX; }
+        if lvl > 0 { self.ris |= UART_INT_RT; } else { self.ris &= !UART_INT_RT; }
     }
 
     /// Push a byte into the TX FIFO. If the UART is disabled or
@@ -503,6 +553,7 @@ impl UartRegs {
         while self.tx_cycle_accum >= sysclks_per_byte && !self.tx_fifo.is_empty() {
             self.tx_cycle_accum -= sysclks_per_byte;
             let byte = self.tx_fifo.pop_front().unwrap();
+            self.tx_wire_log.push(byte);
             if loopback && self.rx_fifo.len() < rx_cap {
                 self.rx_fifo.push_back(byte);
             }

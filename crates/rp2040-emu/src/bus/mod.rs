@@ -388,6 +388,9 @@ pub struct Bus {
     /// the bitmap into both cores' NVIC pending latches per inner-loop
     /// iteration (HLD V7 §5.2).
     pub(crate) irq_pending: u32,
+    /// PSM FRCE_OFF.PROC1 edge for the emulator to apply to core 1:
+    /// `Some(true)` = held in reset, `Some(false)` = released.
+    pub(crate) core1_psm_reset: Option<bool>,
     /// Per-core NVIC — one pending/enabled/priority set per CPU. The
     /// System Control Space NVIC registers (`0xE000_E100..0xE000_E41F`)
     /// are banked per-core on M0+; `nvics[active_core]` is the one the
@@ -517,6 +520,7 @@ impl Bus {
             pwm: PwmRegs::new(IRQ_PWM_IRQ_WRAP),
             dma: Dma::new(),
             irq_pending: 0,
+            core1_psm_reset: None,
             nvics: [Nvic::new(), Nvic::new()],
             systicks: [SysTick::new(), SysTick::new()],
             psram: None,
@@ -771,6 +775,11 @@ impl Bus {
         self.uart0.drain_tx_log()
     }
 
+    /// Feed one byte into UART0's receiver. False when it was dropped.
+    pub fn uart0_push_rx(&mut self, byte: u8) -> bool {
+        self.uart0.push_rx(byte, &mut self.irq_pending)
+    }
+
     /// Borrow a single DMA channel's observation state.
     ///
     /// External diagnostic harnesses (e.g. `picogus_diff_rp2040`) read
@@ -989,6 +998,10 @@ impl Bus {
                     _ => val,
                 };
                 self.peripheral_regs.insert(canonical, new);
+                // PSM FRCE_OFF bit 16 holds core 1 in reset.
+                if canonical == PSM_BASE + 0x04 && (old ^ new) & (1 << 16) != 0 {
+                    self.core1_psm_reset = Some(new & (1 << 16) != 0);
+                }
                 // GPIO_QSPI_SS_CTRL: a change of the chip-select output
                 // override starts a new flash command.
                 if canonical == IO_QSPI_BASE + 0x0c && (old ^ new) & 0x300 != 0 {

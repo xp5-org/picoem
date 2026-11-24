@@ -455,13 +455,10 @@ impl PioBlock {
             self.pad_oe = 0;
             return;
         }
-        let mut out: u32 = self.shared_pin_values;
-        let mut oe: u32 = self.shared_pin_dirs;
-        // Short-circuit: when no SM has SIDESET_COUNT > 0, the per-SM
-        // loop produces no overlay — the shared latches ARE the merge
-        // result. Saves ~16% of `step_n` cost on common (no-side-set)
-        // programs. See `wrk_journals/2026.04.20 - JRN - PIO step_n
-        // Profiling.md` §R2.
+        // Side-set writes the shared latches as SET/OUT/MOV do, so the
+        // latches are the pad state.
+        let out: u32 = self.shared_pin_values;
+        let oe: u32 = self.shared_pin_dirs;
         if !self.any_sideset_programmed {
             // The `trace!` macro itself is elided in release builds
             // (`release_max_level_info`); the `!=` comparison that
@@ -479,41 +476,6 @@ impl PioBlock {
             self.pad_out = out;
             self.pad_oe = oe;
             return;
-        }
-        for sm in &self.sm {
-            if !sm.enabled {
-                continue;
-            }
-
-            // Side-set pins (separate base/count from PINCTRL)
-            let ss_count = ((sm.pinctrl >> 29) & 7) as u8;
-            let side_en = (sm.execctrl >> 30) & 1 != 0;
-            let actual_ss_pins = if side_en {
-                ss_count.saturating_sub(1)
-            } else {
-                ss_count
-            };
-            if actual_ss_pins > 0 {
-                let ss_base = (sm.pinctrl >> 10) & 0x1F;
-                let ss_mask = if actual_ss_pins >= 32 {
-                    u32::MAX
-                } else {
-                    (1u32 << actual_ss_pins) - 1
-                };
-                let positioned_mask = ss_mask.rotate_left(ss_base);
-
-                let side_pindir = (sm.execctrl >> 29) & 1 != 0;
-                if side_pindir {
-                    // Side-set controls pin directions
-                    oe = (oe & !positioned_mask) | (sm.sideset_dirs & positioned_mask);
-                } else {
-                    // Side-set controls pin values (normal mode). Per RP2350
-                    // §11.3.2.3, value-drive side-set does NOT contribute to
-                    // pad_oe; pin direction is owned by SET/OUT/MOV PINDIRS
-                    // (already merged into `oe` via `shared_pin_dirs` above).
-                    out = (out & !positioned_mask) | (sm.sideset_pins & positioned_mask);
-                }
-            }
         }
         // Diagnostic trace: if pad_out has changed since last merge,
         // emit a `trace!` with the new value AND the diff mask. Fires
@@ -2857,32 +2819,47 @@ mod tests {
         }
     }
 
-    /// `merge_pin_outputs` side-set path with SIDE_EN=1 (line 403) and
-    /// actual_ss_pins > 0 (line 408). Also exercises the side_pindir=1
-    /// direction arm (line 418) and the pad-change trace (line 436).
+    /// Side-set with SIDE_EN=1 and SIDE_PINDIR=1 drives the pin
+    /// direction through the shared latch.
     #[test]
-    fn merge_pin_outputs_side_en_and_side_pindir_arms() {
+    fn sideset_pindir_drives_pad_oe() {
         let mut pio = PioBlock::new();
-        // PINCTRL SM0: SIDESET_COUNT=2 (bits[31:29]=010), SIDESET_BASE=3
-        // (bits[14:10]=3).
+        // PINCTRL SM0: SIDESET_COUNT=2 (bits[31:29]=010), SIDESET_BASE=3.
         pio.sm[0].pinctrl = (2u32 << 29) | (3u32 << 10);
         pio.recompute_any_sideset();
         // EXECCTRL: SIDE_EN=1 (bit 30), SIDE_PINDIR=1 (bit 29).
         pio.sm[0].execctrl = (1u32 << 30) | (1u32 << 29);
-        // Pre-set sideset_dirs so the merge sees a non-zero overlay.
-        pio.sm[0].sideset_dirs = 0b11 << 3;
+        // `mov y, y side 1`: bit 12 enables the side-set, bit 11 is its value.
+        pio.instr_mem[0] = 0xA042 | (1 << 12) | (1 << 11);
         pio.set_sm_enabled(0, true);
-
         pio.step(0);
+        assert_ne!(pio.pad_oe & (1 << 3), 0, "SIDE_PINDIR=1 drives oe");
+    }
 
-        // actual_ss_pins = SIDESET_COUNT - 1 = 1 when SIDE_EN=1. One pin
-        // at SIDESET_BASE=3 → bit 3 of pad_oe must be driven by
-        // sideset_dirs.
-        assert_ne!(
-            pio.pad_oe & (1 << 3),
-            0,
-            "SIDE_PINDIR=1 drives oe via sideset_dirs"
-        );
+    /// A SET to a pin after a side-set to it wins: the pin follows the
+    /// most recent write, as the vsync program of a VGA driver needs,
+    /// `set pins, 0` for the pulse and `side 1` to end it.
+    #[test]
+    fn set_after_sideset_on_same_pin_wins() {
+        let mut pio = PioBlock::new();
+        // SM0: SET_BASE=3 SET_COUNT=1, SIDESET_BASE=3 SIDESET_COUNT=2 with SIDE_EN.
+        pio.sm[0].pinctrl = (2u32 << 29) | (1u32 << 26) | (3u32 << 10) | (3u32 << 5);
+        pio.recompute_any_sideset();
+        // SIDE_EN, WRAP_TOP=31.
+        pio.sm[0].execctrl = (1u32 << 30) | (31u32 << 12);
+        pio.instr_mem[0] = 0xE000; // set pins, 0
+        pio.instr_mem[1] = 0xA042 | (1 << 12) | (1 << 11); // mov y, y side 1
+        pio.instr_mem[2] = 0xE000; // set pins, 0
+        pio.instr_mem[3] = 0x0003; // jmp 3
+        pio.set_sm_enabled(0, true);
+        pio.step(0);
+        assert_eq!(pio.pad_out & (1 << 3), 0, "set pins, 0 drives the pin low");
+        pio.step(0);
+        assert_ne!(pio.pad_out & (1 << 3), 0, "side 1 drives it high");
+        pio.step(0);
+        assert_eq!(pio.pad_out & (1 << 3), 0, "set pins, 0 drives it low again");
+        pio.step(0);
+        assert_eq!(pio.pad_out & (1 << 3), 0, "and it stays low");
     }
 
     /// `merge_pin_outputs` SIDESET_COUNT=5 (max) side-set-value path hits

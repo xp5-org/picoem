@@ -434,10 +434,10 @@ impl Bus {
     }
 
     // --- QMI (0x400D0000) --- QSPI memory interface
-    pub(crate) fn qmi_read(&self, offset: u32) -> u32 {
+    pub(crate) fn qmi_read(&mut self, offset: u32) -> u32 {
+        use crate::peripherals::qmi_direct::QmiDirect;
         match offset {
-            // DIRECT_CSR: force TXEMPTY (bit 16) + RXEMPTY (bit 17) always set
-            0x000 => self.qmi_regs.first().copied().unwrap_or(0) | (1 << 16) | (1 << 17),
+            o if QmiDirect::owns(o) => self.qmi_direct.read32(o),
             _ => {
                 let idx = (offset >> 2) as usize;
                 self.qmi_regs.get(idx).copied().unwrap_or(0)
@@ -446,6 +446,10 @@ impl Bus {
     }
 
     pub(crate) fn qmi_write(&mut self, offset: u32, val: u32) {
+        if crate::peripherals::qmi_direct::QmiDirect::owns(offset) {
+            self.qmi_direct.write32(offset, val);
+            return;
+        }
         let idx = (offset >> 2) as usize;
         if idx < self.qmi_regs.len() {
             self.qmi_regs[idx] = val;

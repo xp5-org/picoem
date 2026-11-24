@@ -205,6 +205,9 @@ impl ThreadedEmulator {
             xosc_regs,
             gpio_hi_noise_state,
             qmi_regs,
+            // PSRAM, QMI direct mode and BOOTRAM are Serial-only for now.
+            qmi_direct: _,
+            bootram: _,
             xip_cache_offset,
             gpio_in,
             gpio_in_hi,

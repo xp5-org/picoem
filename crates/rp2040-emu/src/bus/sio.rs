@@ -592,28 +592,31 @@ impl Sio {
     // --- Divider helpers ---------------------------------------------------
 
     fn divider_result_read(&mut self, offset: u32, core: usize) -> u32 {
+        // DIV_CSR.DIRTY clears when QUOTIENT is read; a REMAINDER read
+        // leaves it set (RP2040 datasheet, SIO DIV_CSR). The SDK reads the
+        // remainder first and the quotient last for that reason, and its
+        // divide wrappers take the slow save-and-restore path while DIRTY
+        // is set.
         let d = &mut self.divider[core];
-        let val = match offset {
-            0x070 => d.quotient,
-            0x074 => d.remainder,
-            _ => return 0,
-        };
-        if d.dirty {
-            d.reads_pending += 1;
-            if d.reads_pending >= 2 {
+        match offset {
+            0x070 => {
                 d.dirty = false;
-                d.reads_pending = 0;
+                d.quotient
             }
+            0x074 => d.remainder,
+            _ => 0,
         }
-        val
     }
 
     fn divider_write(&mut self, offset: u32, val: u32, core: usize) {
         let d = &mut self.divider[core];
         match offset {
+            // A write to either operand starts a new calculation from both
+            // current values, in the mode of the alias written.
             0x060 => {
                 d.dividend = val;
                 d.signed = false;
+                Self::compute_division(d);
             }
             0x064 => {
                 d.divisor = val;
@@ -623,6 +626,7 @@ impl Sio {
             0x068 => {
                 d.dividend = val;
                 d.signed = true;
+                Self::compute_division(d);
             }
             0x06C => {
                 d.divisor = val;

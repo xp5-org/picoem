@@ -7586,22 +7586,30 @@ fn bootrom_diagnostic_run() {
 #[test]
 fn test_qmi_register_roundtrip() {
     let (_, mut bus) = core_and_bus();
-    // M0_TIMING is at QMI offset 0x004
-    bus.write32(0x400D_0004, 0xDEAD_BEEF, 0);
-    assert_eq!(bus.read32(0x400D_0004, 0), 0xDEAD_BEEF);
+    // M0_TIMING is at QMI offset 0x00C, after the three direct-mode registers.
+    bus.write32(0x400D_000C, 0xDEAD_BEEF, 0);
+    assert_eq!(bus.read32(0x400D_000C, 0), 0xDEAD_BEEF);
 }
 
 #[test]
 fn test_qmi_direct_csr_always_ready() {
     let (_, mut bus) = core_and_bus();
-    // Write something to DIRECT_CSR (offset 0x000)
-    bus.write32(0x400D_0000, 0x0000_0042, 0);
+    // DIRECT_CSR with EN and AUTO_CS0N set; nothing sent yet.
+    bus.write32(0x400D_0000, 0x0000_0041, 0);
     let csr = bus.read32(0x400D_0000, 0);
-    // TXEMPTY (bit 16) and RXEMPTY (bit 17) must always be set
-    assert_ne!(csr & (1 << 16), 0, "TXEMPTY must be set");
-    assert_ne!(csr & (1 << 17), 0, "RXEMPTY must be set");
-    // Our written value should also be present
-    assert_ne!(csr & 0x42, 0, "written bits should persist");
+    // Transfers finish at once: BUSY clear, TXEMPTY (bit 11) set, and
+    // RXEMPTY (bit 16) set while nothing has been received.
+    assert_eq!(csr & (1 << 1), 0, "BUSY must read clear");
+    assert_ne!(csr & (1 << 11), 0, "TXEMPTY must be set");
+    assert_ne!(csr & (1 << 16), 0, "RXEMPTY must be set");
+    assert_eq!(csr & (1 << 17), 0, "RXFULL must be clear");
+    assert_eq!(csr & 0xFF, 0x41, "written control bits persist");
+    // One JEDEC ID frame on CS0 fills the RX FIFO with one reply.
+    bus.write32(0x400D_0004, 0x9F, 0);
+    let csr = bus.read32(0x400D_0000, 0);
+    assert_eq!(csr & (1 << 16), 0, "RXEMPTY clears after a pushed word");
+    let _ = bus.read32(0x400D_0008, 0);
+    assert_ne!(bus.read32(0x400D_0000, 0) & (1 << 16), 0);
 }
 
 // ============================================================================
@@ -18164,28 +18172,58 @@ mod stage3_fpu_coverage {
     // ----- VCVT.F32.U32 / VCVT.F32.S32 basic paths (already have tests) --
     // These are simple passthroughs; skipping further.
 
-    // ----- fpu_unary fixed-point stubs (lines 918-980) -------------------
+    // ----- VCVT between F32 and fixed point --------------------------------
 
-    #[test]
-    fn vcvt_fixed_point_opcodes_fault() {
-        // opc3=0b1010 t=0 → VCVT.F32.FX.U16 stub → UsageFault.
-        let mut c = CortexM33::for_test(0);
-        // Build an instruction: opcode bits for unary w/ opc3=0b1010, t=0.
-        let hw0: u16 = 0xEE00 | (1 << 7) | (0b11 << 4) | 0b1010;
-        let hw1: u16 = 0x0A00 | (1 << 6); // t-bit encoding — t=0 at hw1[7]
-        let cy = c.execute_one_wide(hw0, hw1);
-        assert_eq!(cy, 0);
-        assert!(c.has_pending_fault());
+    /// `VCVT.{F32.U32|F32.S32|U32.F32|S32.F32|...} Sd, Sd, #fbits` with Sd = Vd:D.
+    /// opc3 = 1 op 1 U; sx = hw1[7] selects 32 bit; fbits = size - imm4:i.
+    fn enc_vcvt_fx(sd: u8, to_fixed: bool, unsigned: bool, size32: bool, fbits: u32) -> (u16, u16) {
+        let size = if size32 { 32 } else { 16 };
+        let imm = size - fbits;
+        let opc3 = 0b1010 | (to_fixed as u16) << 2 | unsigned as u16;
+        let hw0: u16 = 0xEEB0 | ((sd as u16 & 1) << 6) | opc3;
+        let hw1: u16 = ((sd as u16 >> 1) << 12) | 0x0A40 | (size32 as u16) << 7
+            | ((imm as u16 & 1) << 5) | (imm as u16 >> 1);
+        (hw0, hw1)
     }
 
     #[test]
-    fn vcvt_fixed_point_opcodes_t1_fault() {
+    fn vcvt_f32_u32_fixed_matches_frank_c64_encoding() {
+        // frank-c64's SID renderer: eebb 7aea = vcvt.f32.u32 s14, s14, #11.
+        assert_eq!(enc_vcvt_fx(14, false, true, true, 11), (0xEEBB, 0x7AEA));
         let mut c = CortexM33::for_test(0);
-        let hw0: u16 = 0xEE00 | (1 << 7) | (0b11 << 4) | 0b1010;
-        let hw1: u16 = 0x0A00 | (1 << 7) | (1 << 6); // t=1
-        let cy = c.execute_one_wide(hw0, hw1);
-        assert_eq!(cy, 0);
-        assert!(c.has_pending_fault());
+        c.regs.s[14] = f32::from_bits(3 << 11 | 1 << 10); // 3.5 in Q.11
+        let cy = c.execute_one_wide(0xEEBB, 0x7AEA);
+        assert_eq!(cy, 1);
+        assert!(!c.has_pending_fault());
+        assert_eq!(c.regs.s[14], 3.5);
+    }
+
+    #[test]
+    fn vcvt_fixed_both_directions_and_widths() {
+        let mut c = CortexM33::for_test(0);
+        let mut run = |c: &mut CortexM33, sd: u8, to: bool, u: bool, w: bool, fb: u32| {
+            let (hw0, hw1) = enc_vcvt_fx(sd, to, u, w, fb);
+            assert_eq!(c.execute_one_wide(hw0, hw1), 1);
+            assert!(!c.has_pending_fault());
+        };
+        // S16 Q.8 -1.5 = 0xFE80 in the low half, upper half ignored.
+        c.regs.s[3] = f32::from_bits(0xABCD_FE80);
+        run(&mut c, 3, false, false, false, 8);
+        assert_eq!(c.regs.s[3], -1.5);
+        // F32 -> S32 Q.16 truncates toward zero.
+        c.regs.s[5] = -2.75;
+        run(&mut c, 5, true, false, true, 16);
+        assert_eq!(c.regs.s[5].to_bits() as i32, -(2 << 16) - (3 << 14));
+        // F32 -> U16 saturates and sets IOC; the result is zero extended.
+        c.regs.fpscr = 0;
+        c.regs.s[6] = 1.0e9;
+        run(&mut c, 6, true, true, false, 0);
+        assert_eq!(c.regs.s[6].to_bits(), 0xFFFF);
+        assert_eq!(c.regs.fpscr & 1, 1);
+        // F32 -> S16 of a negative value is sign extended.
+        c.regs.s[7] = -1.0;
+        run(&mut c, 7, true, false, false, 4);
+        assert_eq!(c.regs.s[7].to_bits(), 0xFFFF_FFF0);
     }
 
     // ----- VMRS to non-APSR (Rt != 15) already covered by vmrs_to_register
@@ -32790,7 +32828,7 @@ mod stage6_periph_long_tail {
 
         // Loopback false branch in tick (line 389 if-false branch).
         #[test]
-        fn tick_without_loopback_does_not_populate_rx() {
+        fn tick_without_loopback_reads_idle_miso() {
             let mut s = s0();
             let mut irqs = 0u64;
             s.write32(SSPCR0, 7, 0, &mut irqs);
@@ -32799,8 +32837,37 @@ mod stage6_periph_long_tail {
             s.write32(SSPCPSR, 2, 0, &mut irqs);
             s.write32(SSPDR, 0xAA, 0, &mut irqs);
             s.tick(1_000, &tree(), &mut irqs);
-            // RX FIFO must remain empty.
+            // Each frame out shifts one in. With no device on the wires the
+            // master reads the idle MISO level, all ones.
+            assert!(s.rx_dreq());
+            assert_eq!(s.read32(SSPDR), 0xFF);
             assert!(!s.rx_dreq());
+        }
+
+        struct Echo(Vec<(u32, u32)>);
+        impl SpiDevice for Echo {
+            fn exchange(&mut self, mosi: u32, bits: u32, _pins: u64) -> u32 {
+                self.0.push((mosi, bits));
+                mosi ^ 0xFF
+            }
+        }
+
+        #[test]
+        fn attached_device_answers_each_frame() {
+            let mut s = s0();
+            let mut irqs = 0u64;
+            s.attach_device(Box::new(Echo(Vec::new())));
+            s.write32(SSPCR0, 7, 0, &mut irqs);
+            s.write32(SSPCR1, 1 << 1, 0, &mut irqs);
+            s.write32(SSPCPSR, 2, 0, &mut irqs);
+            s.write32(SSPDR, 0x12, 0, &mut irqs);
+            s.write32(SSPDR, 0x34, 0, &mut irqs);
+            s.tick(1_000, &tree(), &mut irqs);
+            assert_eq!(s.read32(SSPDR), 0xED);
+            assert_eq!(s.read32(SSPDR), 0xCB);
+            // A reset leaves the device wired.
+            s.reset();
+            assert!(s.detach_device().is_some());
         }
     }
 
@@ -35565,4 +35632,28 @@ fn smc_invalidation_filtered_by_code_page() {
     assert!(bus.pending_cache_invalidations.is_empty(), "store wholly in a code-free page queued");
     bus.write16(code, 5, 0);
     assert!(!bus.pending_cache_invalidations.is_empty());
+}
+
+#[test]
+fn test_bootram_holds_words_and_seeds_xip_setup() {
+    // The SDK copies the XIP setup routine out of BOOTRAM's first 256 bytes.
+    let (_, mut bus) = core_and_bus();
+    assert_eq!(bus.read32(0x400E_0000, 0), 0);
+    bus.write32(0x400E_03FC, 0x1234_5678, 0);
+    assert_eq!(bus.read32(0x400E_03FC, 0), 0x1234_5678);
+    bus.seed_bootram_xip_setup();
+    assert_eq!(bus.read32(0x400E_0000, 0) & 0xFFFF, 0x4770);
+}
+
+#[test]
+fn test_rom_word_write_is_ignored_like_byte_write() {
+    // frank-c64 stores through a null Tape pointer at boot: a byte to 0x1C,
+    // then a word to 0x24. Both are ROM writes, dropped without a fault.
+    let (_, mut bus) = core_and_bus();
+    let before = bus.read32(0x24, 0);
+    bus.write8(0x1C, 0x55, 0);
+    bus.write16(0x20, 0x5555, 0);
+    bus.write32(0x24, 0xDEAD_BEEF, 0);
+    assert!(!bus.atomics.is_bus_fault(0), "ROM writes must not fault");
+    assert_eq!(bus.read32(0x24, 0), before);
 }

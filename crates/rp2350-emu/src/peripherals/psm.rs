@@ -41,7 +41,14 @@ pub struct Psm {
     frce_on: u32,
     frce_off: u32,
     wdsel: u32,
+    /// Last FRCE_OFF.PROC1 edge not yet taken: `Some(true)` = core 1 forced
+    /// off, `Some(false)` = released. A harness that stands in for the
+    /// bootrom takes it with `Bus::take_core1_reset_edge`.
+    proc1_edge: Option<bool>,
 }
+
+/// FRCE_OFF.PROC1: holds core 1 in reset.
+const PROC1_BIT: u32 = 1 << 24;
 
 impl Psm {
     pub fn new() -> Self {
@@ -49,7 +56,13 @@ impl Psm {
             frce_on: 0,
             frce_off: 0,
             wdsel: 0,
+            proc1_edge: None,
         }
+    }
+
+    /// Take the last FRCE_OFF.PROC1 edge since the previous call.
+    pub fn take_proc1_edge(&mut self) -> Option<bool> {
+        self.proc1_edge.take()
     }
 
     /// Read a word. `DONE` mirrors `FRCE_ON` (instant handshake).
@@ -67,7 +80,13 @@ impl Psm {
     pub fn write32(&mut self, offset: u32, value: u32, alias: u32) {
         match offset {
             FRCE_ON_OFFSET => apply_alias_rmw(&mut self.frce_on, value, alias),
-            FRCE_OFF_OFFSET => apply_alias_rmw(&mut self.frce_off, value, alias),
+            FRCE_OFF_OFFSET => {
+                let old = self.frce_off;
+                apply_alias_rmw(&mut self.frce_off, value, alias);
+                if (old ^ self.frce_off) & PROC1_BIT != 0 {
+                    self.proc1_edge = Some(self.frce_off & PROC1_BIT != 0);
+                }
+            }
             WDSEL_OFFSET => apply_alias_rmw(&mut self.wdsel, value, alias),
             DONE_OFFSET => { /* RO — ignore */ }
             _ => { /* unmodelled — drop */ }

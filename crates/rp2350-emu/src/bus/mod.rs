@@ -417,6 +417,12 @@ pub struct Bus {
     pub(crate) xip_sram: Box<[u8; 16384]>,
     /// QMI register backing store (offsets 0x000..0x06C, 28 words).
     pub(crate) qmi_regs: [u32; 28],
+    /// BOOTRAM, 1 KB at 0x400E_0000. The bootrom leaves the XIP setup
+    /// routine in its first 256 bytes, which the SDK copies and runs to
+    /// re-enter XIP after a direct-mode flash operation.
+    pub(crate) bootram: [u32; 256],
+    /// QMI direct-mode port and the PSRAM on CS1, if the board has one.
+    pub(crate) qmi_direct: crate::peripherals::qmi_direct::QmiDirect,
     /// CLK_REF_CTRL register (CLOCKS offset 0x030).
     pub(crate) clk_ref_ctrl: u32,
     /// CLK_SYS_CTRL register (CLOCKS offset 0x060).
@@ -667,6 +673,8 @@ impl Bus {
             boot_ram: Box::new([0u8; 4096]),
             xip_sram: Box::new([0u8; 16384]),
             qmi_regs: [0u32; 28],
+            bootram: [0u32; 256],
+            qmi_direct: crate::peripherals::qmi_direct::QmiDirect::new(),
             clk_ref_ctrl: 0,
             clk_sys_ctrl: 0,
             clk_sys_div: 0x0001_0000,
@@ -711,6 +719,58 @@ impl Bus {
     /// firmware clock changes.
     pub fn sys_clk_hz(&self) -> u32 {
         self.clock_tree.sys_clk_hz
+    }
+
+    // --- Board wiring for harnesses ---
+
+    /// Take every byte UART `idx` has put on its TX wire since the last call.
+    pub fn drain_uart_tx_log(&mut self, idx: usize) -> Vec<u8> {
+        self.uart[idx].drain_tx_log()
+    }
+
+    /// Take the last PSM FRCE_OFF.PROC1 edge: `Some(true)` when core 1 was
+    /// forced off, `Some(false)` when released, as `multicore_reset_core1`
+    /// does. For harnesses that skip the bootrom and stand in for core 1's
+    /// reset and its wait loop.
+    pub fn take_core1_reset_edge(&mut self) -> Option<bool> {
+        self.psm.take_proc1_edge()
+    }
+
+    /// Feed one byte into UART `idx`'s receiver. False when it was dropped.
+    pub fn uart_push_rx(&mut self, idx: usize, byte: u8) -> bool {
+        let mut irqs = 0u64;
+        let ok = self.uart[idx].push_rx(byte, &mut irqs);
+        self.raise_irqs_u64(irqs);
+        ok
+    }
+
+    /// Fit a QSPI PSRAM of `size` bytes on QMI chip select 1, mapped at
+    /// 0x1100_0000 and its uncached alias 0x1500_0000.
+    pub fn attach_psram(&mut self, size: usize) {
+        self.qmi_direct.attach_psram(size);
+    }
+
+    /// Fill the BOOTRAM XIP setup slot as the bootrom does before it enters
+    /// the image, for harnesses that boot straight from the vector table.
+    /// picoem's flash stays mapped in every QMI mode, so the routine only
+    /// has to return.
+    pub fn seed_bootram_xip_setup(&mut self) {
+        self.bootram[0] = 0x0000_4770; // bx lr
+    }
+
+    /// The PSRAM array on CS1, if one is fitted.
+    pub fn psram_data(&self) -> Option<&[u8]> {
+        self.qmi_direct.psram().map(|p| p.data())
+    }
+
+    /// Wire an external device to SPI `idx`.
+    pub fn attach_spi_device(&mut self, idx: usize, dev: Box<dyn crate::peripherals::spi::SpiDevice>) {
+        self.spi[idx].attach_device(dev);
+    }
+
+    /// Unwire the device on SPI `idx`.
+    pub fn detach_spi_device(&mut self, idx: usize) -> Option<Box<dyn crate::peripherals::spi::SpiDevice>> {
+        self.spi[idx].detach_device()
     }
 
     /// Seed the clock-tree frequencies (both `sys_clk_hz` and
@@ -800,6 +860,16 @@ impl Bus {
             peri_clk_hz = self.clock_tree.peri_clk_hz,
             "clock tree recomputed",
         );
+    }
+
+    /// Offset into the PSRAM for an address in the XIP M1 window, that is
+    /// 0x11xx_xxxx or its uncached alias 0x15xx_xxxx, or None.
+    #[inline]
+    fn psram_window(addr: u32) -> Option<u32> {
+        match addr >> 24 {
+            0x11 | 0x15 => Some(addr & 0x00FF_FFFF),
+            _ => None,
+        }
     }
 
     // --- XIP SRAM helpers (0x1C00_0000..0x1C00_3FFF) ---
@@ -1245,6 +1315,10 @@ impl Bus {
         if !self.is_held_in_reset_bit(RESET_UART1) {
             self.uart[1].tick(sys_clks, &self.clock_tree, &mut ext_irqs);
         }
+        let pins = (self.gpio_in.load(Ordering::Relaxed) as u64)
+            | ((self.gpio_in_hi.load(Ordering::Relaxed) as u64) << 32);
+        self.spi[0].set_pins(pins);
+        self.spi[1].set_pins(pins);
         if !self.is_held_in_reset_bit(RESET_SPI0) {
             self.spi[0].tick(sys_clks, &self.clock_tree, &mut ext_irqs);
         }
@@ -1673,6 +1747,9 @@ impl Bus {
                 .memory
                 .xip_read8((addr - 0x1C00_0000) + self.xip_cache_offset),
             0x1 if Self::is_xip_sram(addr) => self.xip_sram_read8(addr),
+            0x1 if Self::psram_window(addr).is_some() && self.qmi_direct.psram().is_some() => {
+                self.qmi_direct.psram_read(addr & 0x00FF_FFFF, 1).unwrap_or(0) as u8
+            }
             0x1 => {
                 if !self.flash_loaded {
                     self.atomics.set_bus_fault(core as usize, addr);
@@ -1754,6 +1831,7 @@ impl Bus {
                     0
                 } else {
                     match base {
+                        0x400E_0000 if offset < 0x400 => self.bootram[(offset >> 2) as usize],
                         0x4000_0000 => self.sysinfo_read(offset),
                         0x4002_0000 => self.resets_read(offset),
                         0x4001_0000 => self.clocks_read(offset),
@@ -1868,6 +1946,9 @@ impl Bus {
 
         let offset = addr & 0x00FF_FFFF;
         match region {
+            0x1 if Self::psram_window(addr).is_some() && self.qmi_direct.psram().is_some() => {
+                self.qmi_direct.psram_write(addr & 0x00FF_FFFF, 1, val as u32);
+            }
             0x1 if Self::is_xip_sram(addr) => {
                 self.xip_sram_write8(addr, val);
                 self.invalidate_pc_range(addr, 1);
@@ -2274,11 +2355,14 @@ impl Bus {
                             //   - SHIFTCTRL byte 3 holds FJOIN bits that
                             //     drop FIFO contents on change.
                             // Drop narrow writes to non-TXF PIO
-                            // registers — matches the rp2040-emu sibling
-                            // crate's design philosophy (per chip's bus
-                            // generation: AHB-Lite replicates, AHB5
-                            // strobes — same outcome for the bottom byte
-                            // that PIO's `OUT PINS, 8` cares about).
+                            // registers.
+                            //
+                            // The pushed word is the byte replicated into
+                            // all four lanes, as the datasheet's narrow IO
+                            // register writes describe. Programs that shift
+                            // out MSB first from bit 31 depend on it: the
+                            // SDK's pio_spi driver stores each byte with an
+                            // 8-bit write and sends bits 31..24.
                             let word_addr = canonical & !3;
                             let byte_idx = (canonical & 3) as usize;
                             let reg_offset = word_addr & 0x0000_0FFF;
@@ -2288,7 +2372,8 @@ impl Bus {
                                     0x5030_0000 => 1,
                                     _ => 2,
                                 };
-                                let word_val = (val as u32) << (byte_idx * 8);
+                                let _ = byte_idx;
+                                let word_val = (val as u32) * 0x0101_0101;
                                 self.pio[pio_idx].write32(reg_offset, word_val, alias);
                             }
                         }
@@ -2436,6 +2521,9 @@ impl Bus {
                 .memory
                 .xip_read16((addr - 0x1C00_0000) + self.xip_cache_offset),
             0x1 if Self::is_xip_sram(addr) => self.xip_sram_read16(addr),
+            0x1 if Self::psram_window(addr).is_some() && self.qmi_direct.psram().is_some() => {
+                self.qmi_direct.psram_read(addr & 0x00FF_FFFF, 2).unwrap_or(0) as u16
+            }
             0x1 => {
                 if !self.flash_loaded {
                     self.atomics.set_bus_fault(core as usize, addr);
@@ -2515,6 +2603,7 @@ impl Bus {
                     0
                 } else {
                     match base {
+                        0x400E_0000 if offset < 0x400 => self.bootram[(offset >> 2) as usize],
                         0x4000_0000 => self.sysinfo_read(offset),
                         0x4002_0000 => self.resets_read(offset),
                         0x4001_0000 => self.clocks_read(offset),
@@ -2646,6 +2735,9 @@ impl Bus {
 
         let offset = addr & 0x00FF_FFFF;
         match region {
+            0x1 if Self::psram_window(addr).is_some() && self.qmi_direct.psram().is_some() => {
+                self.qmi_direct.psram_write(addr & 0x00FF_FFFF, 2, val as u32);
+            }
             0x1 if Self::is_xip_sram(addr) => {
                 self.xip_sram_write16(addr, val);
                 self.invalidate_pc_range(addr, 2);
@@ -3003,9 +3095,9 @@ impl Bus {
                             self.raise_irqs_u64(ext_irqs);
                         }
                         0x5020_0000 | 0x5030_0000 | 0x5040_0000 => {
-                            // PIO narrow halfword: same AHB-widening
-                            // story and same TXF-only-widen policy as
-                            // the byte arm. See the `write8` PIO arm
+                            // PIO narrow halfword: same TXF-only policy
+                            // as the byte arm, the halfword replicated
+                            // into both halves. See the `write8` PIO arm
                             // above for the full rationale (FDEBUG/IRQ
                             // W1C, SMn_INSTR force-execute, CTRL byte 1
                             // SM_RESTART, SHIFTCTRL byte 3 FJOIN, RXF
@@ -3019,7 +3111,8 @@ impl Bus {
                                     0x5030_0000 => 1,
                                     _ => 2,
                                 };
-                                let word_val = (val as u32) << (half_idx * 16);
+                                let _ = half_idx;
+                                let word_val = (val as u32) * 0x0001_0001;
                                 self.pio[pio_idx].write32(reg_offset, word_val, alias);
                             }
                         }
@@ -3122,6 +3215,9 @@ impl Bus {
                 self.memory.xip_read32(xip_offset)
             }
             0x1 if Self::is_xip_sram(addr) => self.xip_sram_read32(addr),
+            0x1 if Self::psram_window(addr).is_some() && self.qmi_direct.psram().is_some() => {
+                self.qmi_direct.psram_read(addr & 0x00FF_FFFF, 4).unwrap_or(0) 
+            }
             0x1 => {
                 if !self.flash_loaded {
                     self.atomics.set_bus_fault(core as usize, addr);
@@ -3148,6 +3244,7 @@ impl Bus {
                     0
                 } else {
                     match base {
+                        0x400E_0000 if offset < 0x400 => self.bootram[(offset >> 2) as usize],
                         0x4000_0000 => self.sysinfo_read(offset),
                         0x4002_0000 => self.resets_read(offset),
                         0x4001_0000 => self.clocks_read(offset),
@@ -3259,6 +3356,9 @@ impl Bus {
 
         let offset = addr & 0x00FF_FFFF;
         match region {
+            0x1 if Self::psram_window(addr).is_some() && self.qmi_direct.psram().is_some() => {
+                self.qmi_direct.psram_write(addr & 0x00FF_FFFF, 4, val as u32);
+            }
             0x1 if Self::is_xip_sram(addr) => {
                 self.xip_sram_write32(addr, val);
                 self.invalidate_pc_range(addr, 4);
@@ -3290,6 +3390,7 @@ impl Bus {
                     // no-op
                 } else {
                     match base {
+                        0x400E_0000 if offset < 0x400 => self.bootram[(offset >> 2) as usize] = val,
                         0x4002_0000 => self.resets_write(offset, val, alias),
                         0x400D_0000 => self.qmi_write(offset, val),
                         0x4001_0000 => self.clocks_write(offset, val, alias),
@@ -3431,6 +3532,10 @@ impl Bus {
                 let offset = addr - CORESIGHT_TRACE_BASE;
                 self.coresight_trace.write32(offset, val, 0);
             }
+            // The boot ROM ignores writes, at every width, as write8 and
+            // write16 already do. Firmware that stores through a null
+            // object pointer lands here and carries on, as on silicon.
+            0x0 if addr < 0x8000 => {}
             // Unmapped regions raise a precise bus fault so flush-style
             // writers (Phase 7 Stage B lazy FP) and other speculative
             // stores see the failure. Mirrors the read32 unmapped path.

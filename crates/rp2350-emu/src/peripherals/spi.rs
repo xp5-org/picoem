@@ -98,6 +98,19 @@ pub const SSP_FIFO_DEPTH: usize = 8;
 const PERIPH_ID: [u32; 4] = [0x22, 0x10, 0x34, 0x00];
 const PCELL_ID: [u32; 4] = [0x0D, 0xF0, 0x05, 0xB1];
 
+/// A device on the far end of an SPI master's wires. The SPI calls
+/// `exchange` once per frame as the frame finishes shifting: `mosi` is the
+/// word sent, `bits` the frame width and `pins` the GPIO levels at that
+/// moment, so a device can see its chip select. The return value is the
+/// word clocked in on MISO.
+pub trait SpiDevice: Send {
+    fn exchange(&mut self, mosi: u32, bits: u32, pins: u64) -> u32;
+}
+
+/// MISO level read with no device attached and loopback off: all ones,
+/// a floating line under the pad's default pull-up.
+pub const SPI_IDLE_MISO: u32 = 0xFFFF;
+
 /// PL022-derived SPI.
 pub struct SpiRegs {
     cr0: u32,
@@ -112,6 +125,8 @@ pub struct SpiRegs {
     nvic_irq: u32,
     dreq_tx: u8,
     dreq_rx: u8,
+    device: Option<Box<dyn SpiDevice>>,
+    pins: u64,
 }
 
 impl SpiRegs {
@@ -132,14 +147,36 @@ impl SpiRegs {
             nvic_irq,
             dreq_tx,
             dreq_rx,
+            device: None,
+            pins: 0,
         }
     }
 
+    /// Reset the registers and FIFOs. An attached device stays attached:
+    /// it is board wiring, not chip state.
     pub fn reset(&mut self) {
         let irq = self.nvic_irq;
         let dtx = self.dreq_tx;
         let drx = self.dreq_rx;
+        let dev = self.device.take();
         *self = Self::new(irq, dtx, drx);
+        self.device = dev;
+    }
+
+    /// Wire `dev` to this SPI's pins, replacing any device there before.
+    pub fn attach_device(&mut self, dev: Box<dyn SpiDevice>) {
+        self.device = Some(dev);
+    }
+
+    /// Unwire and return the attached device.
+    pub fn detach_device(&mut self) -> Option<Box<dyn SpiDevice>> {
+        self.device.take()
+    }
+
+    /// GPIO levels passed to the device with each frame. The bus sets them
+    /// before every tick.
+    pub fn set_pins(&mut self, pins: u64) {
+        self.pins = pins;
     }
 
     /// DREQ index for TX FIFO (consumed by the DMA matrix).
@@ -383,11 +420,22 @@ impl SpiRegs {
         while self.tx_cycle_accum >= spw && !self.tx_fifo.is_empty() {
             self.tx_cycle_accum -= spw;
             let word = self.tx_fifo.pop_front().unwrap_or(0);
-            // In loopback mode the PL022 shift register ties TX out
-            // back to RX in -- the popped word appears in the RX FIFO
-            // after one word-time, matching silicon's baud-timed path.
-            if self.is_loopback() && self.rx_fifo.len() < SSP_FIFO_DEPTH {
-                self.rx_fifo.push_back(word);
+            // Every frame shifted out shifts one in. Loopback ties TX out
+            // to RX in; otherwise the word comes from the attached device,
+            // or reads the idle MISO level. A full RX FIFO loses the word
+            // and raises the overrun interrupt.
+            let mask = self.frame_data_mask();
+            let rx = if self.is_loopback() {
+                word
+            } else if let Some(dev) = self.device.as_mut() {
+                dev.exchange(word, mask.count_ones(), self.pins) & mask
+            } else {
+                SPI_IDLE_MISO & mask
+            };
+            if self.rx_fifo.len() < SSP_FIFO_DEPTH {
+                self.rx_fifo.push_back(rx);
+            } else {
+                self.ris |= SSP_INT_ROR;
             }
         }
         self.refresh_tx_rx_interrupts();

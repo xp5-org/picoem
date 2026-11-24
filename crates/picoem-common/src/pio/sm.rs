@@ -335,8 +335,22 @@ impl StateMachine {
                 }
                 return;
             }
+            let resolved = std::mem::replace(&mut self.stall_kind, StallKind::None);
             self.stalled = false;
-            self.stall_kind = StallKind::None;
+            // IRQ WAIT has already set its flag and has now seen it
+            // cleared: it completes here, since running it again would set
+            // the flag again.
+            if let StallKind::IrqWait { .. } = resolved {
+                let (insn, is_forced) = match self.pending_exec.take() {
+                    Some(forced) => (forced, true),
+                    None => (instr_mem[self.pc as usize], false),
+                };
+                self.delay_count = decode(insn, self.pinctrl, self.execctrl).delay;
+                if !is_forced {
+                    self.advance_pc();
+                }
+                return;
+            }
             // Fall through to re-execute the stalled instruction.
             // PC hasn't advanced, so fetch from instr_mem[pc] gets the same
             // instruction — this time the stall condition is resolved (e.g. FIFO
@@ -358,9 +372,6 @@ impl StateMachine {
         // Decode
         let decoded = decode(insn, self.pinctrl, self.execctrl);
 
-        // Apply side-set ALWAYS (even if instruction will stall)
-        self.apply_sideset(&decoded);
-
         // Execute — returns true if instruction set PC directly (JMP, OUT PC, MOV PC)
         let pc_set = self.execute_insn(
             &decoded,
@@ -369,6 +380,11 @@ impl StateMachine {
             shared_pin_values,
             shared_pin_dirs,
         );
+
+        // Side-set applies even when the instruction stalls. It writes the
+        // same pin latches as SET, OUT and MOV, after them, so it wins a
+        // same-cycle write to one pin and a later SET to that pin wins over it.
+        self.apply_sideset(&decoded, shared_pin_values, shared_pin_dirs);
 
         // If not stalled, set delay and advance PC
         if !self.stalled {
@@ -438,16 +454,9 @@ impl StateMachine {
                 let pin_val = (gpio_in >> pin) & 1 != 0;
                 pin_val != polarity
             }
-            StallKind::WaitIrq { polarity, index } => {
-                let flag_set = (*irq_flags >> (index & 7)) & 1 != 0;
-                if flag_set == polarity {
-                    // Match — auto-clear the flag
-                    *irq_flags &= !(1 << (index & 7));
-                    false
-                } else {
-                    true
-                }
-            }
+            // On a match the WAIT runs again from the top, and that run
+            // clears the flag, so it is left set here.
+            StallKind::WaitIrq { polarity, index } => ((*irq_flags >> (index & 7)) & 1 != 0) != polarity,
             StallKind::IrqWait { index } => {
                 // Wait until the flag we set is cleared by someone else
 
@@ -523,7 +532,7 @@ impl StateMachine {
     }
 
     /// Apply side-set values to pins.
-    fn apply_sideset(&mut self, decoded: &DecodedInsn) {
+    fn apply_sideset(&mut self, decoded: &DecodedInsn, shared_pin_values: &mut u32, shared_pin_dirs: &mut u32) {
         if let Some(ss_val) = decoded.sideset {
             let sideset_count = ((self.pinctrl >> 29) & 7) as u8;
             let side_en = (self.execctrl >> 30) & 1 != 0;
@@ -541,10 +550,12 @@ impl StateMachine {
                 let mut pd = self.sideset_dirs;
                 Self::write_pin_field(&mut pd, ss_val as u32, sideset_base, actual_pins);
                 self.sideset_dirs = pd;
+                Self::write_pin_field(shared_pin_dirs, ss_val as u32, sideset_base, actual_pins);
             } else {
                 let mut sp = self.sideset_pins;
                 Self::write_pin_field(&mut sp, ss_val as u32, sideset_base, actual_pins);
                 self.sideset_pins = sp;
+                Self::write_pin_field(shared_pin_values, ss_val as u32, sideset_base, actual_pins);
             }
         }
     }
@@ -1429,7 +1440,7 @@ mod tests {
             sm.pinctrl,
             sm.execctrl,
         );
-        sm.apply_sideset(&decoded);
+        sm.apply_sideset(&decoded, &mut 0, &mut 0);
         assert_ne!(sm.sideset_dirs & (1 << 4), 0, "sideset_dirs bit 4 set");
         assert_eq!(sm.sideset_pins, u32::MAX, "sideset_pins untouched");
     }
@@ -1499,6 +1510,49 @@ mod tests {
     }
 
     /// WAIT IRQ (source=2) with flag mismatch stalls (line 668 else arm).
+    #[test]
+    fn wait_irq_completes_after_stalling() {
+        // pc0 `wait 1 irq 0`, pc1 `nop` (mov y, y). Another SM sets the
+        // flag while this one is stalled: the WAIT completes once, moves
+        // on to pc1 and clears the flag.
+        let mut instr_mem = [0u16; 32];
+        instr_mem[0] = 0x20c0;
+        instr_mem[1] = 0xa042;
+        let mut sm = StateMachine::new();
+        let (mut irq, mut pins, mut dirs) = (0u8, 0u32, 0u32);
+        sm.execute_cycle(&instr_mem, &mut irq, 0, &mut pins, &mut dirs);
+        sm.execute_cycle(&instr_mem, &mut irq, 0, &mut pins, &mut dirs);
+        assert!(sm.stalled);
+        assert_eq!(sm.pc, 0);
+        irq = 1;
+        sm.execute_cycle(&instr_mem, &mut irq, 0, &mut pins, &mut dirs);
+        assert!(!sm.stalled, "the WAIT completes on the cycle it sees the flag");
+        assert_eq!(sm.pc, 1);
+        assert_eq!(irq, 0, "the WAIT clears the flag it waited for");
+    }
+
+    #[test]
+    fn irq_wait_completes_once_flag_cleared() {
+        // pc0 `irq wait 0`, pc1 `nop`. The flag is set and the SM stalls
+        // until someone else clears it; then it moves on without setting
+        // the flag again.
+        let mut instr_mem = [0u16; 32];
+        instr_mem[0] = 0xc020;
+        instr_mem[1] = 0xa042;
+        let mut sm = StateMachine::new();
+        let (mut irq, mut pins, mut dirs) = (0u8, 0u32, 0u32);
+        sm.execute_cycle(&instr_mem, &mut irq, 0, &mut pins, &mut dirs);
+        assert!(sm.stalled);
+        assert_eq!(irq, 1);
+        sm.execute_cycle(&instr_mem, &mut irq, 0, &mut pins, &mut dirs);
+        assert!(sm.stalled);
+        irq = 0;
+        sm.execute_cycle(&instr_mem, &mut irq, 0, &mut pins, &mut dirs);
+        assert!(!sm.stalled);
+        assert_eq!(sm.pc, 1);
+        assert_eq!(irq, 0, "the IRQ WAIT does not set its flag again");
+    }
+
     #[test]
     fn wait_irq_source_two_stalls_when_condition_unmet() {
         let mut sm = StateMachine::new();

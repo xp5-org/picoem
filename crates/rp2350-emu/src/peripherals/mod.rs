@@ -33,6 +33,7 @@ pub mod powman;
 pub mod psm;
 pub mod pwm;
 pub mod sha256;
+pub mod qmi_direct;
 pub mod spi;
 pub mod ticks;
 pub mod timer;

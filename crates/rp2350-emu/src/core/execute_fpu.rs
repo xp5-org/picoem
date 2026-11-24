@@ -912,6 +912,64 @@ impl CortexM33 {
     //   opc3 = hw0[3:0] (repurposed Vn field, since these are single-operand)
     //   T    = hw1[7]   (repurposed N bit)
 
+    /// VCVT.F32.{S,U}{16,32} Sd, Sd, #fbits and VCVT.{S,U}{16,32}.F32 Sd, Sd, #fbits.
+    ///
+    /// Encoding `1110 1110 1D11 1o1U | Vd 101 sf sx 1 i 0 imm4`. Sd is both
+    /// source and destination. sx picks a 16 or 32 bit fixed-point value and
+    /// fbits = size - imm4:i. To float rounds to nearest; to fixed rounds
+    /// toward zero and saturates, raising IOC on NaN or out of range. A 16 bit
+    /// result is sign or zero extended into the register, as the operand is
+    /// read from its low half.
+    fn fpu_vcvt_fixed(&mut self, hw0: u16, hw1: u16, sd: usize) -> u32 {
+        let to_fixed = hw0 & 0b0100 != 0;
+        let unsigned = hw0 & 0b0001 != 0;
+        let size: i32 = if (hw1 >> 7) & 1 != 0 { 32 } else { 16 };
+        let imm = (((hw1 & 0xF) << 1) | ((hw1 >> 5) & 1)) as i32;
+        let fbits = (size - imm).max(0);
+        let scale = (fbits as f64).exp2();
+        if !to_fixed {
+            let raw = self.regs.s[sd].to_bits();
+            let v: f64 = match (size, unsigned) {
+                (16, true) => (raw & 0xFFFF) as f64,
+                (16, false) => (raw as u16 as i16) as f64,
+                (_, true) => raw as f64,
+                _ => (raw as i32) as f64,
+            };
+            self.regs.s[sd] = (v / scale) as f32;
+            return 1;
+        }
+        let x = self.regs.s[sd] as f64 * scale;
+        let (lo, hi): (f64, f64) = match (size, unsigned) {
+            (16, true) => (0.0, 65535.0),
+            (16, false) => (-32768.0, 32767.0),
+            (_, true) => (0.0, 4_294_967_295.0),
+            _ => (-2_147_483_648.0, 2_147_483_647.0),
+        };
+        let t = x.trunc();
+        let (q, invalid) = if x.is_nan() {
+            (0.0, true)
+        } else if t < lo {
+            (lo, true)
+        } else if t > hi {
+            (hi, true)
+        } else {
+            (t, false)
+        };
+        if invalid {
+            self.regs.fpscr |= 1; // IOC
+        } else if t != x {
+            self.regs.fpscr |= 1 << 4; // IXC
+        }
+        let bits: u32 = match (size, unsigned) {
+            (16, true) => q as u32,
+            (16, false) => q as i32 as i16 as i32 as u32,
+            (_, true) => q as u32,
+            _ => q as i32 as u32,
+        };
+        self.regs.s[sd] = f32::from_bits(bits);
+        1
+    }
+
     fn fpu_unary(&mut self, hw0: u16, hw1: u16, sd: usize, sm: usize) -> u32 {
         let opc3 = hw0 & 0xF;
         let t = (hw1 >> 7) & 1;
@@ -1026,26 +1084,9 @@ impl CortexM33 {
                 self.regs.s[sd] = bits as f32;
                 1
             }
-            (0b1010, 0) => {
-                // VCVT.F32.FX.U16 — fixed-point, stub
-                self.pending_fault = Some(super::Fault::UsageFault);
-                0
-            }
-            (0b1010, 1) => {
-                // VCVT.F32.FX.S16 — fixed-point, stub
-                self.pending_fault = Some(super::Fault::UsageFault);
-                0
-            }
-            (0b1011, 0) => {
-                // VCVT.F32.FX.U32 — fixed-point, stub
-                self.pending_fault = Some(super::Fault::UsageFault);
-                0
-            }
-            (0b1011, 1) => {
-                // VCVT.F32.FX.S32 — fixed-point, stub
-                self.pending_fault = Some(super::Fault::UsageFault);
-                0
-            }
+            // VCVT between F32 and fixed point, both directions: opc3 is
+            // 1 op 1 U, op set for float to fixed, U set for unsigned.
+            (0b1010 | 0b1011 | 0b1110 | 0b1111, _) => self.fpu_vcvt_fixed(hw0, hw1, sd),
             (0b1100, 0) => {
                 // VCVTR.U32.F32 Sd, Sm — float → unsigned int (round per FPSCR)
                 let rmode = fpscr_rmode(self.regs.fpscr);
@@ -1071,26 +1112,6 @@ impl CortexM33 {
                 let result = f32_to_i32_rtz(self.regs.s[sm]);
                 self.regs.s[sd] = f32::from_bits(result as u32);
                 1
-            }
-            (0b1110, 0) => {
-                // VCVT.FX.U16.F32 — fixed-point, stub
-                self.pending_fault = Some(super::Fault::UsageFault);
-                0
-            }
-            (0b1110, 1) => {
-                // VCVT.FX.S16.F32 — fixed-point, stub
-                self.pending_fault = Some(super::Fault::UsageFault);
-                0
-            }
-            (0b1111, 0) => {
-                // VCVT.FX.U32.F32 — fixed-point, stub
-                self.pending_fault = Some(super::Fault::UsageFault);
-                0
-            }
-            (0b1111, 1) => {
-                // VCVT.FX.S32.F32 — fixed-point, stub
-                self.pending_fault = Some(super::Fault::UsageFault);
-                0
             }
             _ => {
                 self.pending_fault = Some(super::Fault::UsageFault);

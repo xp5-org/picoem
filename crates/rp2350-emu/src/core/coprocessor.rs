@@ -1,6 +1,19 @@
 use super::{CoreBus, CortexM33, Fault};
 use crate::sio::Sio;
 
+
+/// RCP boolean encodings, as `RCP_MASK_TRUE` / `RCP_MASK_FALSE` in the
+/// SDK's hardware/rcp.h. Any other value is an invalid boolean.
+pub const RCP_TRUE: u32 = 0xA500_A500;
+pub const RCP_FALSE: u32 = 0x00C3_00C3;
+/// `rcp_ivalid` parity constant, `RCP_MASK_INTXOR`.
+pub const RCP_INTXOR: u32 = 0x9600_9600;
+
+#[inline]
+fn rcp_bool_valid(v: u32) -> bool {
+    v == RCP_TRUE || v == RCP_FALSE
+}
+
 impl CortexM33 {
     /// Top-level coprocessor dispatch.
     pub(crate) fn thumb32_coprocessor<B: CoreBus>(
@@ -35,12 +48,83 @@ impl CortexM33 {
     /// CP0 (GPIOC): GPIO coprocessor — SDK-emitted ops wired to SIO fast-path
     /// and `Bus.gpio_in`. See `cp0_mcr_mrc_family` for the encoding table.
     fn cp0_gpioc<B: CoreBus>(&mut self, hw0: u16, hw1: u16, bus: &mut B) -> u32 {
-        let is_mrc_mcr = (hw0 >> 12) & 0xF == 0xE && hw1 & (1 << 4) != 0;
-        if is_mrc_mcr {
+        // hw0[11:8] separates the families: 0xE MCR/MRC/CDP, 0xC MCRR/MRRC.
+        // hw1 bit 4 means MCR/MRC only within the 0xE family; in MCRR it is
+        // the low bit of opc1.
+        if hw0 & 0xEFE0 == 0xEC40 {
+            self.cp0_mcrr_mrrc_family(hw0, hw1, bus)
+        } else if (hw0 >> 8) & 0xF == 0xE && hw1 & (1 << 4) != 0 {
             self.cp0_mcr_mrc_family(hw0, hw1, bus)
         } else {
             1 // CDP not used by CP0 — silent NOP, match existing stub style.
         }
+    }
+
+    /// CP0 MCRR/MRRC: the two-register GPIO coprocessor ops of the SDK's
+    /// hardware/gpio_coproc.h.
+    ///
+    /// - hw0 = `1110 1100 010 L Rt2[4]` (L=0 MCRR, L=1 MRRC)
+    /// - hw1 = `Rt[4] coproc[4] opc1[4] CRm[4]`
+    ///
+    /// CRm picks the bank, c0 OUT, c4 OE, c8 IN for MRRC. MCRR opc1 0..3 is a
+    /// 64-bit put/xor/set/clr with Rt the low word and Rt2 the high word;
+    /// opc1 4..7 is a single-pin put/xor2/set2/clr2 with Rt the pin and Rt2
+    /// the value. MRRC opc1 0 reads the bank into Rt low and Rt2 high. The
+    /// high bank, pins 30..47, is RAZ/WI as in the MCR/MRC paths.
+    fn cp0_mcrr_mrrc_family<B: CoreBus>(&mut self, hw0: u16, hw1: u16, bus: &mut B) -> u32 {
+        let is_mrrc = hw0 & 0x0010 != 0;
+        let rt2 = (hw0 & 0xF) as usize;
+        let rt = ((hw1 >> 12) & 0xF) as usize;
+        let opc1 = ((hw1 >> 4) & 0xF) as u8;
+        let crm = (hw1 & 0xF) as u8;
+        if is_mrrc {
+            if opc1 == 0 {
+                let lo = match crm {
+                    0 => bus.gpio_read_out(),
+                    4 => bus.gpio_read_oe(),
+                    8 => bus.gpio_read_in(),
+                    _ => 0,
+                } & Sio::PIN_MASK;
+                self.regs.r[rt] = lo;
+                self.regs.r[rt2] = 0;
+            }
+            return 1;
+        }
+        let oe = match crm {
+            0 => false,
+            4 => true,
+            _ => return 1,
+        };
+        let (a, b) = (self.regs.r[rt], self.regs.r[rt2]);
+        let (op, mask) = match opc1 {
+            0..=3 => (opc1, a & Sio::PIN_MASK),
+            4..=7 => {
+                if a >= 30 {
+                    return 1;
+                }
+                let m = 1u32 << a;
+                let on = b & 1 != 0;
+                match opc1 {
+                    4 => (if on { 2 } else { 3 }, m),
+                    _ if !on => return 1,
+                    5 => (1, m),
+                    6 => (2, m),
+                    _ => (3, m),
+                }
+            }
+            _ => return 1,
+        };
+        match (oe, op) {
+            (false, 0) => bus.gpio_write_out(mask),
+            (false, 1) => bus.gpio_xor_out(mask),
+            (false, 2) => bus.gpio_set_out(mask),
+            (false, 3) => bus.gpio_clear_out(mask),
+            (true, 0) => bus.gpio_write_oe(mask),
+            (true, 1) => bus.gpio_xor_oe(mask),
+            (true, 2) => bus.gpio_set_oe(mask),
+            _ => bus.gpio_clear_oe(mask),
+        }
+        1
     }
 
     /// CP0 MCR/MRC dispatch — matches HLD §C.1 / Pico SDK `hardware_gpio.h`.
@@ -593,6 +677,18 @@ impl CortexM33 {
                     };
                     self.regs.xpsr = (self.regs.xpsr & 0x0FFF_FFFF) | n;
                 }
+                (1, 0) => {
+                    // rcp_canary_status Rt: the RCP boolean for salt_valid[core].
+                    self.regs.r[rt] = if self.atomics.rcp_salt_is_valid(core) {
+                        RCP_TRUE
+                    } else {
+                        RCP_FALSE
+                    };
+                }
+                (2, 0) => {
+                    // rcp_random_byte Rt: a byte 0..=255, zero extended.
+                    self.regs.r[rt] = self.atomics.rcp_random_byte(core) as u32;
+                }
                 _ => {} // unrecognized MRC: silent NOP
             }
             return 1;
@@ -616,19 +712,16 @@ impl CortexM33 {
                     self.pending_fault = Some(Fault::Nmi);
                 }
             }
-            (1, 0) => {
-                // rcp_bvalid Rt — assert Rt ∈ {0, 1}.
-                let v = self.regs.r[rt];
-                if v > 1 {
-                    self.pending_fault = Some(Fault::Nmi);
-                }
-            }
-            // rcp_btrue Rt — assert Rt == 1.
-            (2, 0) if self.regs.r[rt] != 1 => {
+            // rcp_bvalid Rt — assert Rt is RCP_TRUE or RCP_FALSE.
+            (1, 0) if !rcp_bool_valid(self.regs.r[rt]) => {
                 self.pending_fault = Some(Fault::Nmi);
             }
-            // rcp_bfalse Rt — assert Rt == 0.
-            (3, 1) if self.regs.r[rt] != 0 => {
+            // rcp_btrue Rt — assert Rt == RCP_TRUE.
+            (2, 0) if self.regs.r[rt] != RCP_TRUE => {
+                self.pending_fault = Some(Fault::Nmi);
+            }
+            // rcp_bfalse Rt — assert Rt == RCP_FALSE.
+            (3, 1) if self.regs.r[rt] != RCP_FALSE => {
                 self.pending_fault = Some(Fault::Nmi);
             }
             (4, 0) => {
@@ -685,12 +778,29 @@ impl CortexM33 {
         let rt = ((hw1 >> 12) & 0xF) as usize;
         let rt2 = (hw0 & 0xF) as usize;
 
+        let (a, b) = (self.regs.r[rt], self.regs.r[rt2]);
+        let holds = match (opc1, crm) {
+            // rcp_b2valid: both valid booleans.
+            (0, 8) => rcp_bool_valid(a) && rcp_bool_valid(b),
+            // rcp_b2and: both true.
+            (1, 0) => a == RCP_TRUE && b == RCP_TRUE,
+            // rcp_b2or: both valid, at least one true.
+            (2, 0) => rcp_bool_valid(a) && rcp_bool_valid(b) && (a == RCP_TRUE || b == RCP_TRUE),
+            // rcp_bxorvalid / bxortrue / bxorfalse: Rt ^ Rt2 is valid / true / false.
+            (3, 8) => rcp_bool_valid(a ^ b),
+            (4, 0) => a ^ b == RCP_TRUE,
+            (5, 8) => a ^ b == RCP_FALSE,
+            // rcp_ivalid: Rt ^ Rt2 == RCP_INTXOR.
+            (6, 8) => a ^ b == RCP_INTXOR,
+            // rcp_iequal: Rt == Rt2.
+            (7, _) => a == b,
+            _ => true,
+        };
+        if !holds {
+            self.pending_fault = Some(Fault::Nmi);
+            return 1;
+        }
         match opc1 {
-            // rcp_iequal Rt, Rt2 — assert Rt == Rt2 (bootrom 0xFC4x_x770).
-            // Equal case (assertion holds) falls through to the catch-all.
-            7 if self.regs.r[rt] != self.regs.r[rt2] => {
-                self.pending_fault = Some(Fault::Nmi);
-            }
             8 => {
                 match crm {
                     0 => {
@@ -704,11 +814,7 @@ impl CortexM33 {
                     _ => {} // unrecognized salt CRm: silent NOP
                 }
             }
-            _ => {
-                // rcp_b2valid, rcp_bxortrue, rcp_bxorfalse, rcp_ivalid:
-                // bootrom uses these sparingly; silent NOP matches existing
-                // stub behavior (HLD §8.4 skip list).
-            }
+            _ => {} // assertions, checked above
         }
         1
     }
@@ -1327,71 +1433,134 @@ mod tests {
         assert!(matches!(cpu.pending_fault, Some(Fault::Nmi)));
     }
 
+    // ---------- CP0 MCRR / MRRC ----------
+
+    fn encode_mcrr_cp0(l: bool, opc1: u8, rt2: u8, rt: u8, crm: u8) -> (u16, u16) {
+        let hw0: u16 = 0xEC40 | if l { 0x10 } else { 0 } | (rt2 as u16 & 0xF);
+        let hw1: u16 = ((rt as u16) << 12) | (opc1 as u16 & 0xF) << 4 | (crm as u16 & 0xF);
+        (hw0, hw1)
+    }
+
+    #[test]
+    fn test_cp0_mcrr_bit_put_and_bulk_ops() {
+        // gpioc_bit_oe_put / gpioc_bit_out_put, as gpio_set_dir and gpio_put emit them.
+        let mut cpu = CortexM33::for_test(0);
+        let mut bus = Bus::default();
+        enable_cp(&mut cpu, 0);
+        let op = |cpu: &mut CortexM33, bus: &mut Bus, l: bool, opc1: u8, crm: u8, a: u32, b: u32| {
+            cpu.regs.r[3] = a;
+            cpu.regs.r[2] = b;
+            let (hw0, hw1) = encode_mcrr_cp0(l, opc1, 2, 3, crm);
+            cpu.thumb32_coprocessor(hw0, hw1, bus);
+        };
+        op(&mut cpu, &mut bus, false, 4, 4, 5, 1);
+        assert_eq!(bus.sio.gpio_oe, 1 << 5);
+        op(&mut cpu, &mut bus, false, 4, 0, 5, 1);
+        assert_eq!(bus.sio.gpio_out, 1 << 5);
+        op(&mut cpu, &mut bus, false, 4, 0, 5, 0);
+        assert_eq!(bus.sio.gpio_out, 0);
+        op(&mut cpu, &mut bus, false, 6, 0, 7, 0);
+        assert_eq!(bus.sio.gpio_out, 0, "set2 with val 0 does nothing");
+        op(&mut cpu, &mut bus, false, 6, 0, 7, 1);
+        assert_eq!(bus.sio.gpio_out, 1 << 7);
+        op(&mut cpu, &mut bus, false, 0, 0, 0xF0, 0);
+        assert_eq!(bus.sio.gpio_out, 0xF0);
+        op(&mut cpu, &mut bus, false, 1, 0, 0x30, 0);
+        assert_eq!(bus.sio.gpio_out, 0xC0);
+        op(&mut cpu, &mut bus, false, 3, 4, 1 << 5, 0);
+        assert_eq!(bus.sio.gpio_oe, 0);
+        // gpioc_hilo_out_get
+        op(&mut cpu, &mut bus, true, 0, 0, 0, 0xDEAD);
+        assert_eq!((cpu.regs.r[3], cpu.regs.r[2]), (0xC0, 0));
+    }
+
+    // ---------- rcp_random_byte ----------
+
+    #[test]
+    fn test_rcp_random_byte_is_a_byte() {
+        // The bootrom's random-delay loop shifts this value right by 6 and
+        // counts it down to zero; anything outside 0..=255 corrupts the
+        // canary that encloses the loop.
+        let (mut cpu, mut bus) = rcp_setup();
+        let (hw0, hw1) = encode_mrc2_full(7, 2, 0, 3, 0, 0);
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..64 {
+            cpu.regs.r[3] = 0xFFFF_C000;
+            cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
+            assert!(cpu.regs.r[3] <= 0xFF, "got {:#x}", cpu.regs.r[3]);
+            seen.insert(cpu.regs.r[3]);
+        }
+        assert!(seen.len() > 16, "PRNG must vary, saw {} values", seen.len());
+        assert!(cpu.pending_fault.is_none());
+    }
+
     // ---------- rcp_btrue / rcp_bfalse ----------
 
-    #[test]
-    fn test_rcp_btrue_pass() {
-        let (mut cpu, mut bus) = rcp_setup();
-        cpu.regs.r[0] = 1;
-        let (hw0, hw1) = encode_mcr2_full(7, 2, 0, 0, 0, 0);
-        cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
-        assert!(cpu.pending_fault.is_none());
+    fn rcp_mcr(cpu: &mut CortexM33, bus: &mut Bus, opc1: u8, rt: u8, op2: u8, v: u32) -> bool {
+        cpu.pending_fault = None;
+        cpu.regs.r[rt as usize] = v;
+        let (hw0, hw1) = encode_mcr2_full(7, opc1, 0, rt, op2, 0);
+        cpu.thumb32_coprocessor(hw0, hw1, bus);
+        cpu.pending_fault.is_none()
     }
 
     #[test]
-    fn test_rcp_btrue_fail_raises_nmi() {
+    fn test_rcp_btrue_takes_the_true_pattern_only() {
         let (mut cpu, mut bus) = rcp_setup();
-        cpu.regs.r[0] = 0;
-        let (hw0, hw1) = encode_mcr2_full(7, 2, 0, 0, 0, 0);
-        cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
-        assert!(matches!(cpu.pending_fault, Some(Fault::Nmi)));
+        assert!(rcp_mcr(&mut cpu, &mut bus, 2, 0, 0, super::RCP_TRUE));
+        for v in [super::RCP_FALSE, 1, 0] {
+            assert!(!rcp_mcr(&mut cpu, &mut bus, 2, 0, 0, v), "btrue {v:#x}");
+        }
     }
 
     #[test]
-    fn test_rcp_bfalse_pass() {
+    fn test_rcp_bfalse_takes_the_false_pattern_only() {
         let (mut cpu, mut bus) = rcp_setup();
-        cpu.regs.r[3] = 0;
-        let (hw0, hw1) = encode_mcr2_full(7, 3, 0, 3, 1, 0);
-        cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
-        assert!(cpu.pending_fault.is_none());
+        assert!(rcp_mcr(&mut cpu, &mut bus, 3, 3, 1, super::RCP_FALSE));
+        for v in [super::RCP_TRUE, 0, 1] {
+            assert!(!rcp_mcr(&mut cpu, &mut bus, 3, 3, 1, v), "bfalse {v:#x}");
+        }
     }
 
     #[test]
-    fn test_rcp_bfalse_fail_raises_nmi() {
+    fn test_rcp_bvalid_takes_both_patterns() {
+        // The bootrom asserts a computed false, 0x00c300c3, at 0x37ce.
         let (mut cpu, mut bus) = rcp_setup();
-        cpu.regs.r[3] = 1;
-        let (hw0, hw1) = encode_mcr2_full(7, 3, 0, 3, 1, 0);
-        cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
-        assert!(matches!(cpu.pending_fault, Some(Fault::Nmi)));
-    }
-
-    // ---------- rcp_bvalid ----------
-
-    #[test]
-    fn test_rcp_bvalid_pass_zero() {
-        let (mut cpu, mut bus) = rcp_setup();
-        cpu.regs.r[5] = 0;
-        let (hw0, hw1) = encode_mcr2_full(7, 1, 0, 5, 0, 0);
-        cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
-        assert!(cpu.pending_fault.is_none());
+        assert!(rcp_mcr(&mut cpu, &mut bus, 1, 5, 0, super::RCP_TRUE));
+        assert!(rcp_mcr(&mut cpu, &mut bus, 1, 5, 0, super::RCP_FALSE));
+        for v in [0, 1, 2, 0xA500_A501] {
+            assert!(!rcp_mcr(&mut cpu, &mut bus, 1, 5, 0, v), "bvalid {v:#x}");
+        }
     }
 
     #[test]
-    fn test_rcp_bvalid_pass_one() {
+    fn test_rcp_canary_status_register_form() {
         let (mut cpu, mut bus) = rcp_setup();
-        cpu.regs.r[5] = 1;
-        let (hw0, hw1) = encode_mcr2_full(7, 1, 0, 5, 0, 0);
+        let (hw0, hw1) = encode_mrc2_full(7, 1, 0, 4, 0, 0);
         cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
-        assert!(cpu.pending_fault.is_none());
+        assert_eq!(cpu.regs.r[4], super::RCP_TRUE);
     }
 
     #[test]
-    fn test_rcp_bvalid_fail_raises_nmi() {
+    fn test_rcp_two_operand_assertions() {
         let (mut cpu, mut bus) = rcp_setup();
-        cpu.regs.r[5] = 2;
-        let (hw0, hw1) = encode_mcr2_full(7, 1, 0, 5, 0, 0);
-        cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
-        assert!(matches!(cpu.pending_fault, Some(Fault::Nmi)));
+        let (t, f) = (super::RCP_TRUE, super::RCP_FALSE);
+        let mut run = |opc1: u8, crm: u8, a: u32, b: u32| {
+            cpu.pending_fault = None;
+            cpu.regs.r[0] = a;
+            cpu.regs.r[1] = b;
+            let (hw0, hw1) = encode_mcrr2(7, opc1, 1, 0, crm);
+            cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
+            cpu.pending_fault.is_none()
+        };
+        assert!(run(0, 8, t, f) && !run(0, 8, t, 1));
+        assert!(run(1, 0, t, t) && !run(1, 0, t, f));
+        assert!(run(2, 0, f, t) && !run(2, 0, f, f) && !run(2, 0, 1, t));
+        assert!(run(3, 8, f ^ 0x1234, 0x1234) && !run(3, 8, 5, 0));
+        assert!(run(4, 0, t ^ 0x55, 0x55) && !run(4, 0, f ^ 0x55, 0x55));
+        assert!(run(5, 8, f ^ 0x77, 0x77) && !run(5, 8, t ^ 0x77, 0x77));
+        assert!(run(6, 8, super::RCP_INTXOR ^ 42, 42) && !run(6, 8, 42, 42));
+        assert!(run(7, 0, 9, 9) && !run(7, 0, 9, 8));
     }
 
     // ---------- rcp_count_init / rcp_count_check ----------
