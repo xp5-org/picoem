@@ -110,6 +110,23 @@ pub const SSP_FIFO_DEPTH: usize = 8;
 const PERIPH_ID: [u32; 4] = [0x22, 0x10, 0x34, 0x00];
 const PCELL_ID: [u32; 4] = [0x0D, 0xF0, 0x05, 0xB1];
 
+/// A device on the far end of an SPI master's wires. The SPI calls
+/// `exchange` once per frame when firmware writes it, the frame shifting at
+/// once rather than at the programmed bit rate: `mosi` is the
+/// word sent, `bits` the frame width and `pins` the GPIO output levels at
+/// that moment, so a device can see its chip select. The return value is
+/// the word clocked in on MISO. `pins_changed` reports every change of the
+/// SIO GPIO outputs, so a device sees a chip select rise and fall between
+/// frames.
+pub trait SpiDevice: Send {
+    fn exchange(&mut self, mosi: u32, bits: u32, pins: u64) -> u32;
+    fn pins_changed(&mut self, _pins: u64) {}
+}
+
+/// MISO level read with no device attached and loopback off: all ones,
+/// a floating line under the pad's default pull-up.
+pub const SPI_IDLE_MISO: u32 = 0xFFFF;
+
 /// PL022-derived SPI (RP2040 §4.4).
 pub struct SpiRegs {
     cr0: u32,
@@ -122,6 +139,8 @@ pub struct SpiRegs {
     rx_fifo: VecDeque<u32>,
     tx_cycle_accum: u64,
     nvic_irq: u32,
+    device: Option<Box<dyn SpiDevice>>,
+    pins: u64,
 }
 
 impl SpiRegs {
@@ -139,12 +158,46 @@ impl SpiRegs {
             rx_fifo: VecDeque::with_capacity(SSP_FIFO_DEPTH),
             tx_cycle_accum: 0,
             nvic_irq,
+            device: None,
+            pins: 0,
         }
     }
 
+    /// Reset the registers and FIFOs. An attached device stays attached:
+    /// it is board wiring, not chip state.
     pub fn reset(&mut self) {
         let irq = self.nvic_irq;
+        let dev = self.device.take();
+        let pins = self.pins;
         *self = Self::new(irq);
+        self.device = dev;
+        self.pins = pins;
+    }
+
+    /// Wire `dev` to this SPI's pins, replacing any device there before.
+    pub fn attach_device(&mut self, dev: Box<dyn SpiDevice>) {
+        self.device = Some(dev);
+    }
+
+    /// Unwire and return the attached device.
+    pub fn detach_device(&mut self) -> Option<Box<dyn SpiDevice>> {
+        self.device.take()
+    }
+
+    /// The attached device, if any.
+    pub fn device_mut(&mut self) -> Option<&mut (dyn SpiDevice + 'static)> {
+        self.device.as_deref_mut()
+    }
+
+    /// GPIO output levels: passed to the device with each frame, and to
+    /// its `pins_changed` when they change.
+    pub fn set_pins(&mut self, pins: u64) {
+        if pins != self.pins {
+            self.pins = pins;
+            if let Some(dev) = self.device.as_mut() {
+                dev.pins_changed(pins);
+            }
+        }
     }
 
     /// True iff no outstanding work — TX and RX FIFOs empty.
@@ -236,6 +289,22 @@ impl SpiRegs {
         }
         let mask = self.frame_data_mask();
         let word = value & mask;
+        if !self.is_loopback() {
+            if let Some(dev) = self.device.as_mut() {
+                // With a device on the wires the frame shifts at once: the
+                // reply is in the RX FIFO before the next instruction, so a
+                // register access costs no quantum of waiting.
+                let rx = dev.exchange(word, mask.count_ones(), self.pins) & mask;
+                if self.rx_fifo.len() < SSP_FIFO_DEPTH {
+                    self.rx_fifo.push_back(rx);
+                } else {
+                    self.ris |= SSP_INT_ROR;
+                }
+                self.refresh_tx_rx_interrupts();
+                self.route_irq(irqs);
+                return;
+            }
+        }
         if self.tx_fifo.len() < SSP_FIFO_DEPTH {
             self.tx_fifo.push_back(word);
             if self.is_loopback() && self.rx_fifo.len() < SSP_FIFO_DEPTH {
@@ -394,9 +463,20 @@ impl SpiRegs {
         while self.tx_cycle_accum >= spw && !self.tx_fifo.is_empty() {
             self.tx_cycle_accum -= spw;
             // Drain one word out of the TX FIFO. In loopback mode the
-            // RX copy was pushed at `push_dr` time so no extra work
-            // here.
+            // RX copy was pushed at `push_dr` time, and with a device
+            // attached the frame never queued. Otherwise every frame
+            // shifted out shifts in the idle MISO level. A full RX FIFO
+            // loses the word and raises the overrun interrupt.
             let _ = self.tx_fifo.pop_front();
+            if !self.is_loopback() {
+                let mask = self.frame_data_mask();
+                let rx = SPI_IDLE_MISO & mask;
+                if self.rx_fifo.len() < SSP_FIFO_DEPTH {
+                    self.rx_fifo.push_back(rx);
+                } else {
+                    self.ris |= SSP_INT_ROR;
+                }
+            }
         }
         self.refresh_tx_rx_interrupts();
         self.route_irq(irqs);
@@ -521,6 +601,56 @@ mod tests {
         // 8 bits at ~1.25 MHz = 6.4 µs/word; 4 words ≈ 26 µs → fully
         // drained inside 80 µs.
         assert!(s.tx_fifo.is_empty());
+    }
+
+    /// Records frames and chip-select changes; answers each frame with
+    /// the inverted MOSI byte.
+    struct Probe(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+    impl SpiDevice for Probe {
+        fn exchange(&mut self, mosi: u32, bits: u32, pins: u64) -> u32 {
+            self.0.lock().unwrap().push(format!("x{mosi:02x}/{bits} cs{}", pins >> 13 & 1));
+            !mosi & 0xFF
+        }
+        fn pins_changed(&mut self, pins: u64) {
+            self.0.lock().unwrap().push(format!("cs{}", pins >> 13 & 1));
+        }
+    }
+
+    #[test]
+    fn device_answers_each_drained_frame() {
+        let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut s = SpiRegs::new(SPI0_IRQ);
+        s.attach_device(Box::new(Probe(log.clone())));
+        let mut irqs = 0;
+        s.write32(SSPCR0, 0x07, 0, &mut irqs);
+        s.write32(SSPCPSR, 2, 0, &mut irqs);
+        s.write32(SSPCR1, SSPCR1_SSE, 0, &mut irqs);
+        s.set_pins(1 << 13);
+        s.set_pins(0);
+        s.write32(SSPDR, 0x42, 0, &mut irqs);
+        s.write32(SSPDR, 0x00, 0, &mut irqs);
+        // The replies are there at once, with the bus idle.
+        assert_ne!(s.read32(SSPSR) & SSPSR_RNE, 0);
+        assert_eq!(s.read32(SSPSR) & SSPSR_BSY, 0);
+        s.set_pins(1 << 13);
+        assert_eq!(s.read32(SSPDR), 0xBD);
+        assert_eq!(s.read32(SSPDR), 0xFF);
+        assert_eq!(*log.lock().unwrap(), ["cs1", "cs0", "x42/8 cs0", "x00/8 cs0", "cs1"]);
+        // A reset keeps the wiring.
+        s.reset();
+        assert!(s.device_mut().is_some());
+    }
+
+    #[test]
+    fn no_device_reads_idle_miso() {
+        let mut s = SpiRegs::new(SPI0_IRQ);
+        let mut irqs = 0;
+        s.write32(SSPCR0, 0x07, 0, &mut irqs);
+        s.write32(SSPCPSR, 2, 0, &mut irqs);
+        s.write32(SSPCR1, SSPCR1_SSE, 0, &mut irqs);
+        s.write32(SSPDR, 0x42, 0, &mut irqs);
+        s.tick(1000, &tree(), &mut irqs);
+        assert_eq!(s.read32(SSPDR), 0xFF);
     }
 
     // --- IRQ routing --------------------------------------------------

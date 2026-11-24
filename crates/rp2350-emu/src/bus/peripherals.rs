@@ -115,6 +115,7 @@ impl Bus {
 
     pub(crate) fn resets_write(&mut self, offset: u32, val: u32, alias: u32) {
         if offset == 0x000 {
+            let before = self.resets_state;
             self.resets_state = match alias {
                 0 => val,
                 1 => self.resets_state ^ val,
@@ -122,6 +123,11 @@ impl Bus {
                 3 => self.resets_state & !val,
                 _ => unreachable!(),
             };
+            // Asserting a block's reset returns it to its reset state.
+            let entered = self.resets_state & !before;
+            if entered & (1 << super::RESET_USBCTRL) != 0 {
+                self.usbctrl.reset();
+            }
         }
     }
 

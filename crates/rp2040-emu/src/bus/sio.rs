@@ -206,6 +206,11 @@ impl Sio {
         self.spinlock_bits
     }
 
+    /// Core `core`'s integer divider.
+    pub fn divider(&self, core: usize) -> &Divider {
+        &self.divider[core]
+    }
+
     /// 32-bit register read. `offset` is masked to 12 bits by Bus. GPIO_IN
     /// (0x004) is handled on Bus before this is called (merges SIO output
     /// with PIO output — Phase 5.B wires PIO in).

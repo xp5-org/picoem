@@ -2,8 +2,12 @@
 //!
 //! RP2040 datasheet §2.19.6. 30 GPIOs × 2 registers each (`GPIO_STATUS`,
 //! `GPIO_CTRL`) = 240 bytes of per-pin state. Registers beyond the pin
-//! block (INTR / PROC0_INTE / PROC1_INTE / …) are stubbed: they read
-//! back what was written so firmware init code sees a round-trip.
+//! block raise GPIO interrupts: each pin has four INTR bits, level low,
+//! level high, edge low and edge high. Edges latch when the input level
+//! changes and clear when firmware writes 1 to them; level bits follow the
+//! input. INTS = (INTR | INTF) & INTE per processor, and IO_IRQ_BANK0 is
+//! asserted while either processor's INTS is non-zero. Dormant-wake
+//! registers are storage only.
 //!
 //! `GPIO_CTRL[4:0]` is FUNCSEL:
 //! * 0 = XIP, 1 = SPI, 2 = UART, 3 = I2C, 4 = PWM, 5 = SIO,
@@ -25,22 +29,68 @@ pub struct IoBank0 {
     pub(crate) out_invert: u32,
     pub(crate) out_low: u32,
     pub(crate) out_high: u32,
-    /// Raw INT / INTE / INTF / INTS storage — 4 × 4 words = 16 words per
-    /// bank (4 banks of 8 pins each). Backing store only; interrupt
-    /// delivery is not modelled in Phase 5.A.
+    /// Latched edge bits of INTR, 4 words of 8 pins; level bits are
+    /// derived from `level_in` on read.
     pub(crate) intr: [u32; 4],
+    /// GPIO input levels, as the bus last computed them.
+    pub(crate) level_in: u32,
     pub(crate) proc0_inte: [u32; 4],
     pub(crate) proc0_intf: [u32; 4],
-    pub(crate) proc0_ints: [u32; 4],
     pub(crate) proc1_inte: [u32; 4],
     pub(crate) proc1_intf: [u32; 4],
-    pub(crate) proc1_ints: [u32; 4],
     pub(crate) dormant_wake_inte: [u32; 4],
     pub(crate) dormant_wake_intf: [u32; 4],
     pub(crate) dormant_wake_ints: [u32; 4],
 }
 
+/// The edge-low and edge-high bits of every pin in an INTR word.
+const EDGE_BITS: u32 = 0xCCCC_CCCC;
+
 impl IoBank0 {
+    /// INTR word `bank`: latched edges plus the level bits of the current
+    /// input levels.
+    fn intr_raw(&self, bank: usize) -> u32 {
+        let mut v = self.intr[bank];
+        for i in 0..8 {
+            let pin = bank * 8 + i;
+            if pin >= NUM_GPIOS {
+                break;
+            }
+            let high = (self.level_in >> pin) & 1;
+            v |= (if high != 0 { 0b0010 } else { 0b0001 }) << (4 * i);
+        }
+        v
+    }
+
+    /// INTS word `bank` for processor `proc`.
+    fn ints(&self, proc: usize, bank: usize) -> u32 {
+        let (inte, intf) = if proc == 0 {
+            (self.proc0_inte[bank], self.proc0_intf[bank])
+        } else {
+            (self.proc1_inte[bank], self.proc1_intf[bank])
+        };
+        (self.intr_raw(bank) | intf) & inte
+    }
+
+    /// New GPIO input levels: latch the edges against the previous ones.
+    pub(crate) fn set_inputs(&mut self, levels: u32) {
+        let changed = (self.level_in ^ levels) & ((1 << NUM_GPIOS) - 1);
+        if changed != 0 {
+            for pin in 0..NUM_GPIOS {
+                if changed & (1 << pin) != 0 {
+                    let bit = if levels & (1 << pin) != 0 { 0b1000 } else { 0b0100 };
+                    self.intr[pin / 8] |= bit << (4 * (pin % 8));
+                }
+            }
+        }
+        self.level_in = levels;
+    }
+
+    /// IO_IRQ_BANK0 level: either processor has an enabled interrupt.
+    pub(crate) fn irq_active(&self) -> bool {
+        (0..4).any(|b| self.ints(0, b) != 0 || self.ints(1, b) != 0)
+    }
+
     pub fn new() -> Self {
         // FUNCSEL default for every pin is 31 (NULL / Hi-Z).
         let mut ctrl = [0u32; NUM_GPIOS];
@@ -53,12 +103,11 @@ impl IoBank0 {
             out_low: 0,
             out_high: 0,
             intr: [0; 4],
+            level_in: 0,
             proc0_inte: [0; 4],
             proc0_intf: [0; 4],
-            proc0_ints: [0; 4],
             proc1_inte: [0; 4],
             proc1_intf: [0; 4],
-            proc1_ints: [0; 4],
             dormant_wake_inte: [0; 4],
             dormant_wake_intf: [0; 4],
             dormant_wake_ints: [0; 4],
@@ -93,10 +142,7 @@ impl IoBank0 {
         }
         // Interrupt block starts at 0x0F0.
         match off {
-            0x0F0 => self.intr[0],
-            0x0F4 => self.intr[1],
-            0x0F8 => self.intr[2],
-            0x0FC => self.intr[3],
+            0x0F0..=0x0FC => self.intr_raw(((off & 0xF) >> 2) as usize),
             0x100 => self.proc0_inte[0],
             0x104 => self.proc0_inte[1],
             0x108 => self.proc0_inte[2],
@@ -105,10 +151,7 @@ impl IoBank0 {
             0x114 => self.proc0_intf[1],
             0x118 => self.proc0_intf[2],
             0x11C => self.proc0_intf[3],
-            0x120 => self.proc0_ints[0],
-            0x124 => self.proc0_ints[1],
-            0x128 => self.proc0_ints[2],
-            0x12C => self.proc0_ints[3],
+            0x120..=0x12C => self.ints(0, ((off & 0xF) >> 2) as usize),
             0x130 => self.proc1_inte[0],
             0x134 => self.proc1_inte[1],
             0x138 => self.proc1_inte[2],
@@ -117,10 +160,7 @@ impl IoBank0 {
             0x144 => self.proc1_intf[1],
             0x148 => self.proc1_intf[2],
             0x14C => self.proc1_intf[3],
-            0x150 => self.proc1_ints[0],
-            0x154 => self.proc1_ints[1],
-            0x158 => self.proc1_ints[2],
-            0x15C => self.proc1_ints[3],
+            0x150..=0x15C => self.ints(1, ((off & 0xF) >> 2) as usize),
             0x160 => self.dormant_wake_inte[0],
             0x164 => self.dormant_wake_inte[1],
             0x168 => self.dormant_wake_inte[2],
@@ -169,17 +209,16 @@ impl IoBank0 {
             }
             return;
         }
-        // INTR (0x0F0) is W1C (write-1-to-clear); other interrupt regs are
-        // plain storage. Phase 5.A keeps this simple.
+        // INTR is write-1-to-clear on its edge bits under every alias;
+        // INTS is read-only; the rest is plain storage.
         let idx = |o: u32| ((o & 0xF) >> 2) as usize;
         match off {
-            0x0F0..=0x0FC => self.intr[idx(off)] = apply(self.intr[idx(off)], val),
+            0x0F0..=0x0FC => self.intr[idx(off)] &= !(val & EDGE_BITS),
+            0x120..=0x12C | 0x150..=0x15C => {}
             0x100..=0x10C => self.proc0_inte[idx(off)] = apply(self.proc0_inte[idx(off)], val),
             0x110..=0x11C => self.proc0_intf[idx(off)] = apply(self.proc0_intf[idx(off)], val),
-            0x120..=0x12C => self.proc0_ints[idx(off)] = apply(self.proc0_ints[idx(off)], val),
             0x130..=0x13C => self.proc1_inte[idx(off)] = apply(self.proc1_inte[idx(off)], val),
             0x140..=0x14C => self.proc1_intf[idx(off)] = apply(self.proc1_intf[idx(off)], val),
-            0x150..=0x15C => self.proc1_ints[idx(off)] = apply(self.proc1_ints[idx(off)], val),
             0x160..=0x16C => {
                 self.dormant_wake_inte[idx(off)] = apply(self.dormant_wake_inte[idx(off)], val)
             }
@@ -238,9 +277,48 @@ mod tests {
     }
 
     #[test]
-    fn intr_storage_roundtrip() {
+    fn intr_latches_edges_and_clears_on_write() {
         let mut io = IoBank0::new();
-        io.write32(0x0F0, 0xABCD, 0);
-        assert_eq!(io.read32(0x0F0), 0xABCD);
+        io.set_inputs(0);
+        // Pin 2 low: level-low bit only.
+        assert_eq!(io.read32(0x0F0) >> 8 & 0xF, 0b0001);
+        io.set_inputs(1 << 2);
+        // Rising edge latched, level high now.
+        assert_eq!(io.read32(0x0F0) >> 8 & 0xF, 0b1010);
+        io.set_inputs(0);
+        assert_eq!(io.read32(0x0F0) >> 8 & 0xF, 0b1101);
+        // Writing 1s clears the edges; levels cannot be cleared.
+        io.write32(0x0F0, 0xF << 8, 0);
+        assert_eq!(io.read32(0x0F0) >> 8 & 0xF, 0b0001);
+    }
+
+    #[test]
+    fn ints_and_irq_follow_inte_and_intf() {
+        let mut io = IoBank0::new();
+        io.set_inputs(0);
+        // Pin 20 is bank 2, slot 4. Enable its rising edge for proc0.
+        io.write32(0x108, 0b1000 << 16, 0);
+        assert!(!io.irq_active());
+        io.set_inputs(1 << 20);
+        assert_eq!(io.read32(0x128), 0b1000 << 16);
+        assert!(io.irq_active());
+        io.write32(0x0F8, 0b1000 << 16, 0);
+        assert!(!io.irq_active());
+        // INTF forces the interrupt regardless of the pin.
+        io.write32(0x118, 0b1000 << 16, 0);
+        assert!(io.irq_active());
+    }
+
+    #[test]
+    fn level_high_interrupt_follows_pin() {
+        let mut io = IoBank0::new();
+        io.set_inputs(0);
+        io.write32(0x13C, 0b0010 << 4, 0); // proc1, pin 25 level high
+        assert!(!io.irq_active());
+        io.set_inputs(1 << 25);
+        assert!(io.irq_active());
+        assert_eq!(io.read32(0x15C), 0b0010 << 4);
+        io.set_inputs(0);
+        assert!(!io.irq_active());
     }
 }

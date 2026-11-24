@@ -206,11 +206,14 @@ fn classify_thumb32_branch_misc_pure(hw0: u16, hw1: u16) -> bool {
     }
 }
 
-/// Plain load encodings the idle-loop detector may accept inside a poll
-/// loop. Anything not listed counts as a side effect: stores, LDM with
-/// writeback to PC, POP {pc}, exclusive and ordered loads, coprocessor
-/// ops, table branches.
-pub(crate) fn is_idle_load_encoding(hw0: u16, _hw1: u16, wide: bool) -> bool {
+/// Encodings the idle-loop detector may accept inside a poll loop that the
+/// pure classification leaves out: plain loads, POP and LDM with or without
+/// PC, and the 16-bit hi-register ADD / CMP / MOV / BX / BLX group. These
+/// can only change registers; a write to PC that returns from an exception
+/// marks the pass dirty in `exit_exception`, and a fault does through
+/// `pending_fault`. Anything not listed counts as a side effect: stores,
+/// exclusive and ordered loads, coprocessor ops, table branches.
+pub(crate) fn is_idle_clean_encoding(hw0: u16, _hw1: u16, wide: bool) -> bool {
     if !wide {
         match hw0 >> 11 {
             0b01001 => true,          // LDR literal
@@ -223,7 +226,9 @@ pub(crate) fn is_idle_load_encoding(hw0: u16, _hw1: u16, wide: bool) -> bool {
                 // 011 LDRSB, 100 LDR, 101 LDRH, 110 LDRB, 111 LDRSH
                 matches!((hw0 >> 9) & 7, 0b011 | 0b100 | 0b101 | 0b110 | 0b111)
             }
-            0b10111 => (hw0 & 0xFF00) == 0xBC00, // POP without PC
+            0b10111 => (hw0 & 0xFE00) == 0xBC00, // POP, with or without PC
+            0b11001 => true,                       // LDMIA
+            0b01000 => (hw0 & 0x0400) != 0,        // hi-register ops, BX / BLX
             _ => false,
         }
     } else {
@@ -231,6 +236,31 @@ pub(crate) fn is_idle_load_encoding(hw0: u16, _hw1: u16, wide: bool) -> bool {
         matches!(hw0 & 0xFFF0, 0xF8D0 | 0xF890 | 0xF8B0 | 0xF990 | 0xF9B0
             | 0xF850 | 0xF810 | 0xF830 | 0xF910 | 0xF930)
             || (hw0 & 0xFF7F) == 0xF85F // LDR.W literal, either U
+            || matches!(hw0 & 0xFFD0, 0xE890 | 0xE910) // LDMIA.W / LDMDB.W, POP.W
+    }
+}
+
+/// Plain store encodings the idle-loop detector may accept inside a poll
+/// loop: STR, STRB, STRH in every addressing form, PUSH and STM. The write
+/// wrappers log each one, and a pass is idle only if memory is back to its
+/// starting contents. Exclusive, ordered, dual and coprocessor stores are
+/// not listed.
+pub(crate) fn is_idle_store_encoding(hw0: u16, _hw1: u16, wide: bool) -> bool {
+    if !wide {
+        match hw0 >> 11 {
+            0b01100 => true, // STR imm
+            0b01110 => true, // STRB imm
+            0b10000 => true, // STRH imm
+            0b10010 => true, // STR SP-relative
+            0b01010 => true, // STR / STRH / STRB register (opB 000..010)
+            0b11000 => true, // STMIA
+            0b10110 => (hw0 & 0xFE00) == 0xB400, // PUSH
+            _ => false,
+        }
+    } else {
+        // STR{,B,H}.W imm12 and the imm8 / register group; STMIA.W / STMDB.W, PUSH.W.
+        matches!(hw0 & 0xFFF0, 0xF8C0 | 0xF880 | 0xF8A0 | 0xF840 | 0xF800 | 0xF820)
+            || matches!(hw0 & 0xFFD0, 0xE880 | 0xE900)
     }
 }
 
@@ -329,7 +359,8 @@ impl CortexM33 {
         let cond_passed = if in_it { self.regs.condition_passed(cond) } else { true };
         self.last_op_pure = is_pure;
         self.last_op_sleepy = entry.is_sleepy();
-        self.last_op_idle_load = entry.is_idle_load();
+        self.last_op_idle_clean = entry.is_idle_clean();
+        self.last_op_idle_store = entry.is_idle_store();
 
         if is_pure {
             // Fast path: neither the fetch (handled by the cache) nor
@@ -521,8 +552,11 @@ impl CortexM33 {
         if (!wide && ((hw0 & 0xFF00) == 0xBE00 || (hw0 & 0xFF0F) == 0xBF00)) || (wide && hw0 == 0xF3AF) {
             flags |= DecodedOp::FLAG_SLEEPY;
         }
-        if is_idle_load_encoding(hw0, hw1, wide) {
-            flags |= DecodedOp::FLAG_IDLE_LOAD;
+        if is_idle_clean_encoding(hw0, hw1, wide) {
+            flags |= DecodedOp::FLAG_IDLE_CLEAN;
+        }
+        if is_idle_store_encoding(hw0, hw1, wide) {
+            flags |= DecodedOp::FLAG_IDLE_STORE;
         }
 
         let entry = DecodedOp {

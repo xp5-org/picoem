@@ -120,6 +120,8 @@ impl ThreadedEmulator {
             #[cfg(feature = "testing")]
                 pending_panic_inject: _,
             bus_is_placeholder: _,
+            // The idle-loop skip belongs to the Serial model.
+            idle: _,
         } = emu;
 
         let [core0, core1] = cores;

@@ -873,6 +873,7 @@ impl CortexM0Plus {
                         // un-halt on the next pending+enabled IRQ.
                         // PRIMASK is intentionally not consulted for the
                         // wake decision (ARMv6-M ARM B1.5.18).
+                        bus.idle_mark_dirty();
                         let core = self.core_id as usize;
                         if bus.nvic(core).pending_and_enabled() == 0 {
                             self.halt();
@@ -883,6 +884,8 @@ impl CortexM0Plus {
                         // SEV: broadcast event_flag to both cores. The
                         // issuing core's own next WFE will consume the
                         // latch and fall through.
+                        // Idempotent for the idle-loop detector, which
+                        // compares the event flags it sets.
                         bus.signal_sev();
                         1
                     }

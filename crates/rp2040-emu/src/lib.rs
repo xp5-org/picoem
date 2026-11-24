@@ -211,7 +211,49 @@ pub const DEFAULT_STEP_QUANTUM: u32 = 64;
 /// snapshot until the first `run_quantum` promotes them into the
 /// threaded runtime; afterwards the flat fields are zero-cost
 /// placeholders and typed accessors fire a debug-assert if touched.
+/// Architectural state of one core at a loop head, for the idle-loop skip.
+struct IdleSnap {
+    pc: u32,
+    regs: core::registers::Registers,
+    cycles: u64,
+    side: [u32; 9],
+}
+
+/// Exact idle-loop skip for the Serial model. While one core sleeps,
+/// halted or in WFE, nothing but the other core can change memory within a
+/// quantum: peripherals, PIO and DMA move at quantum ends, and so do the
+/// TIMER counters. A running core that comes back to a loop head with the
+/// same registers, memory, spinlocks, divider and event flags as the last
+/// time, having made only
+/// reads that cannot change within the quantum, register ops and plain
+/// SRAM stores, will repeat the pass identically until the quantum ends.
+/// The skip advances its cycle count by as many whole passes as fit, which
+/// is bit-identical to running them. Loop heads are backward branches,
+/// calls and returns to lower addresses included; a snapshot holds across
+/// other heads while the stretch stays clean, and compares only at the same
+/// PC, SP and LR.
+pub struct IdleSkip {
+    /// On by default; off runs every pass, for A/B checks.
+    pub enabled: bool,
+    /// Cycles skipped per core.
+    pub skipped_cycles: [u64; 2],
+    snap: [Option<IdleSnap>; 2],
+    fails: [u8; 2],
+}
+
+impl Default for IdleSkip {
+    fn default() -> Self {
+        Self { enabled: true, skipped_cycles: [0; 2], snap: [None, None], fails: [0; 2] }
+    }
+}
+
+/// Snapshots taken plus failed compares per core per quantum before the
+/// detector backs off.
+const IDLE_MAX_FAILS: u8 = 12;
+
 pub struct Emulator {
+    /// Exact idle-loop skip; see [`IdleSkip`].
+    pub idle: IdleSkip,
     pub cores: [CortexM0Plus; 2],
     pub bus: Bus,
     pub clock: Clock,
@@ -397,6 +439,7 @@ impl Emulator {
         self.bus.uart1.reset();
         self.bus.spi0.reset();
         self.bus.spi1.reset();
+        self.bus.usbctrl.reset();
         self.bus.i2c0.reset();
         self.bus.i2c1.reset();
         self.bus.adc.reset();
@@ -502,6 +545,11 @@ impl Emulator {
             self.cores[0].invalidate_decode_cache_regions(regions);
             self.cores[1].invalidate_decode_cache_regions(regions);
         }
+    }
+
+    /// The whole flash, as firmware has programmed and erased it.
+    pub fn flash_image(&self) -> &[u8] {
+        self.bus.memory.flash()
     }
 
     /// Load an XIP flash image (appears at XIP address `0x1000_0000`).
@@ -662,6 +710,76 @@ impl Emulator {
         }
     }
 
+    /// Whether core `core`'s next step runs under the idle-loop detector:
+    /// it is on and the other core sleeps. Turns bus tracking on to match,
+    /// and drops a snapshot the detector can no longer vouch for.
+    #[inline(always)]
+    fn idle_track(&mut self, core: usize) -> bool {
+        let other = 1 - core;
+        let track = self.idle.enabled && (self.cores[other].is_halted() || self.bus.wfe_waiting[other]);
+        if !track && self.idle.snap[core].is_some() {
+            self.idle_drop(core);
+        }
+        self.bus.idle.on = track;
+        track
+    }
+
+    fn idle_drop(&mut self, core: usize) {
+        if self.idle.snap[core].take().is_some() {
+            self.bus.idle.logging = false;
+            self.bus.idle.log.clear();
+        }
+    }
+
+    /// Core `core` just branched backwards to `pc`. Compares against the
+    /// snapshot or takes one, as [`IdleSkip`] describes; returns the cycles skipped,
+    /// whole passes that fit in `room`.
+    fn idle_head_visit(&mut self, core: usize, pc: u32, room: u64) -> u64 {
+        let clean = !self.bus.idle.dirty;
+        self.bus.idle.dirty = false;
+        if !clean {
+            self.idle_drop(core);
+            return 0;
+        }
+        let c = &self.cores[core];
+        if let Some(s) = &self.idle.snap[core] {
+            if s.pc != pc || s.regs.r[13] != c.regs.r[13] || s.regs.r[14] != c.regs.r[14] {
+                return 0; // another head inside the same clean stretch
+            }
+            if s.regs == c.regs
+                && c.pending_fault.is_none()
+                && s.side == self.bus.idle_side_state(core)
+                && self.bus.idle_memory_restored()
+            {
+                let iter = c.cycles - s.cycles;
+                let skip = if iter > 0 { room / iter * iter } else { 0 };
+                let c = &mut self.cores[core];
+                c.cycles += skip;
+                self.idle.skipped_cycles[core] += skip;
+                let now = c.cycles;
+                if let Some(s) = self.idle.snap[core].as_mut() {
+                    s.cycles = now;
+                }
+                self.bus.idle.log.clear();
+                return skip;
+            }
+            // Same point in the pass, different state: re-take it here.
+            self.idle.fails[core] += 1;
+        }
+        if self.idle.fails[core] >= IDLE_MAX_FAILS {
+            self.idle_drop(core);
+            return 0;
+        }
+        self.idle.fails[core] += 1;
+        let other = 1 - core;
+        self.idle.snap[other] = None;
+        let c = &self.cores[core];
+        self.idle.snap[core] = Some(IdleSnap { pc, regs: c.regs, cycles: c.cycles, side: self.bus.idle_side_state(core) });
+        self.bus.idle.logging = true;
+        self.bus.idle.log.clear();
+        0
+    }
+
     /// Serial-mode single-quantum step. Shared by [`Self::step`] and
     /// [`Self::run_quantum`] on the Serial path.
     fn step_serial(&mut self) -> u64 {
@@ -682,13 +800,27 @@ impl Emulator {
         // shared register).
         let mut c0_total: u64 = 0;
         let mut c1_total: u64 = 0;
+        // Memory, pins and peripherals may have changed since the last
+        // quantum: start the idle-loop detector afresh.
+        self.idle_drop(0);
+        self.idle_drop(1);
+        self.idle.fails = [0; 2];
+        self.bus.idle.dirty = true;
 
         while self.clock.cycles < target
             && (!self.cores[0].is_halted() || !self.cores[1].is_halted())
         {
             let c0 = if !self.cores[0].is_halted() && !self.bus.wfe_waiting[0] {
                 self.bus.set_active_core(0);
-                let c = self.cores[0].step(&mut self.bus) as u64;
+                let track = self.idle_track(0);
+                let pc0 = self.cores[0].regs.pc();
+                let mut c = self.cores[0].step(&mut self.bus) as u64;
+                self.bus.idle.on = false;
+                let pc1 = self.cores[0].regs.pc();
+                if track && pc1 < pc0 {
+                    let room = target.saturating_sub(self.clock.cycles + c);
+                    c += self.idle_head_visit(0, pc1, room);
+                }
                 // Drain decode-cache invalidations recorded by writes
                 // during this step into the core that just ran.
                 // Region-scoped bulk invalidations (load_*) reach BOTH
@@ -705,7 +837,15 @@ impl Emulator {
             let c1 = if !self.cores[1].is_halted() && !self.bus.wfe_waiting[1] {
                 self.bus.set_active_core(1);
                 self.bus.begin_core1_step();
-                let c = self.cores[1].step(&mut self.bus) as u64;
+                let track = self.idle_track(1);
+                let pc0 = self.cores[1].regs.pc();
+                let mut c = self.cores[1].step(&mut self.bus) as u64;
+                self.bus.idle.on = false;
+                let pc1 = self.cores[1].regs.pc();
+                if track && pc1 < pc0 {
+                    let room = target.saturating_sub(self.clock.cycles + c);
+                    c += self.idle_head_visit(1, pc1, room);
+                }
                 Self::drain_cache_invalidations(&mut self.bus, &mut self.cores);
                 self.bus.end_core1_step();
                 self.maybe_wake_core1(1);
@@ -1135,6 +1275,7 @@ impl Emulator {
             #[cfg(feature = "testing")]
             pending_panic_inject: None,
             bus_is_placeholder: false,
+            idle: IdleSkip::default(),
         };
         self.threaded = Some(threaded::ThreadedEmulator::from_emulator(seeded));
         self.bus_is_placeholder = true;
@@ -1200,6 +1341,10 @@ impl Emulator {
             out = (out & !ext_mask) | (self.bus.external_gpio_in_override & ext_mask);
         }
         self.bus.gpio_in = out;
+        self.bus.io_bank0.set_inputs(out);
+        if self.bus.io_bank0.irq_active() {
+            self.bus.irq_pending |= 1 << crate::irq::IRQ_IO_IRQ_BANK0;
+        }
     }
 
     /// WFE/SEV / WFI quantum-end wake check. See `wrk_docs/2026.04.26
@@ -1228,6 +1373,15 @@ impl Emulator {
             // WFE wake: parked core + latched event = consume + un-park.
             if self.bus.wfe_waiting[core] && self.bus.event_flag[core] {
                 self.bus.event_flag[core] = false;
+                self.bus.wfe_waiting[core] = false;
+            }
+            // An enabled interrupt that can preempt also wakes WFE, per
+            // ARMv6-M B1.5.18: the core takes it and returns from the
+            // WFE. With PRIMASK set it cannot, and the core sleeps on.
+            if self.bus.wfe_waiting[core]
+                && self.cores[core].regs.primask & 1 == 0
+                && self.bus.nvics[core].pending_and_enabled() != 0
+            {
                 self.bus.wfe_waiting[core] = false;
             }
             // WFI wake: halted core + pending+enabled IRQ = un-halt.
@@ -1590,6 +1744,7 @@ impl EmulatorBuilder {
                 any(target_os = "windows", target_os = "linux")
             ))]
             bus_is_placeholder: false,
+            idle: IdleSkip::default(),
         };
         // Default: core 1 halted — Pico SDK wakes it via SIO FIFO.
         // Route through the wrapper so the SIO handshake FSM `armed`
@@ -2254,6 +2409,102 @@ mod stage5_lib_residue {
         emu.bus.systicks[0].cvr = 0;
         emu.bus.systicks[1].cvr = 0;
         let _ = emu.step().unwrap();
+    }
+
+    // ------------------- idle-loop skip -------------------
+
+    /// Core 0 runs `prog` from SRAM 0x2000_1000 with `regs` preset and core
+    /// 1 halted, for `cycles` cycles in 4096-cycle quanta. Returns the
+    /// final registers, cycles, the word at 0x2000_0100 and the cycles
+    /// skipped.
+    fn run_idle_prog(prog: &[u16], regs: &[(usize, u32)], cycles: u64, skip: bool) -> ([u32; 16], u64, u32, u64) {
+        let mut emu = Emulator::new(Config::default());
+        for (i, hw) in prog.iter().enumerate() {
+            emu.bus.write16(0x2000_1000 + 2 * i as u32, *hw);
+        }
+        emu.step_quantum = 4096;
+        emu.idle.enabled = skip;
+        let c = &mut emu.cores[0];
+        c.regs.r[13] = 0x2000_2000;
+        c.regs.msp = 0x2000_2000;
+        for &(r, v) in regs {
+            c.regs.r[r] = v;
+        }
+        c.regs.set_pc(0x2000_1000);
+        emu.run(cycles).unwrap();
+        let mem = emu.bus.read32(0x2000_0100);
+        (emu.cores[0].regs.r, emu.cycles(), mem, emu.idle.skipped_cycles[0])
+    }
+
+    /// Calls that push different registers into the same stack slots
+    /// change memory on every store, but each pass leaves it as it found
+    /// it: the pass is skipped, with a bit-identical result.
+    #[test]
+    fn idle_skip_collapses_pass_that_restores_its_stack() {
+        let prog = [
+            0x47A8, // 1000: blx r5     -> f
+            0x47B0, // 1002: blx r6     -> g
+            0xE7FC, // 1004: b 1000
+            0xBF00, // 1006: nop, not reached
+            0xB510, // 1008: f: push {r4, lr}
+            0xBD10, // 100A:    pop {r4, pc}
+            0xB508, // 100C: g: push {r3, lr}
+            0xBD08, // 100E:    pop {r3, pc}
+        ];
+        let regs = [(3, 0x33), (4, 0x44), (5, 0x2000_1009), (6, 0x2000_100D)];
+        let on = run_idle_prog(&prog, &regs, 400_000, true);
+        let off = run_idle_prog(&prog, &regs, 400_000, false);
+        assert_eq!((on.0, on.1), (off.0, off.1));
+        assert_eq!(off.3, 0);
+        assert!(on.3 > 300_000, "skipped only {} of 400000 cycles", on.3);
+    }
+
+    /// A pass that leaves memory changed is never skipped, even when the
+    /// registers repeat.
+    #[test]
+    fn idle_skip_keeps_pass_that_changes_memory() {
+        let prog = [
+            0x6808, // 1000: ldr r0, [r1]
+            0x3001, // 1002: adds r0, #1
+            0x6008, // 1004: str r0, [r1]
+            0x2000, // 1006: movs r0, #0
+            0xE7FA, // 1008: b 1000
+        ];
+        let regs = [(1, 0x2000_0100)];
+        let on = run_idle_prog(&prog, &regs, 100_000, true);
+        let off = run_idle_prog(&prog, &regs, 100_000, false);
+        assert_eq!(on.3, 0, "a counting loop must not be skipped");
+        assert_eq!((on.0, on.1, on.2), (off.0, off.1, off.2));
+        assert!(on.2 > 1000, "the loop ran: count {}", on.2);
+    }
+
+    /// A mutex-style pass: claim and release a spinlock, run a division on
+    /// the SIO divider and send an event. All of it repeats exactly, so it
+    /// is skipped; a pass that leaves the spinlock claimed is not.
+    #[test]
+    fn idle_skip_handles_spinlock_divider_and_sev() {
+        let prog = [
+            0x6808, // 1000: ldr r0, [r1]       claim SPINLOCK0
+            0x6008, // 1002: str r0, [r1]       release it
+            0x601A, // 1004: str r2, [r3]       DIV_UDIVIDEND
+            0x605C, // 1006: str r4, [r3, #4]   DIV_UDIVISOR
+            0x6918, // 1008: ldr r0, [r3, #16]  DIV_QUOTIENT
+            0xBF40, // 100A: sev
+            0xE7F8, // 100C: b 1000
+        ];
+        let regs = [(1, 0xD000_0100), (2, 1000), (3, 0xD000_0060), (4, 7)];
+        let on = run_idle_prog(&prog, &regs, 400_000, true);
+        let off = run_idle_prog(&prog, &regs, 400_000, false);
+        assert_eq!((on.0, on.1), (off.0, off.1));
+        assert_eq!(on.0[0], 142);
+        assert!(on.3 > 300_000, "skipped only {} of 400000 cycles", on.3);
+        // Claim only: the lock stays taken after the first pass, and the
+        // claim read returns 0 from then on, so passes differ until they
+        // settle; the result must still match.
+        let prog = [0x6808, 0x601A, 0xE7FC];
+        let on = run_idle_prog(&prog, &regs, 100_000, true);
+        let off = run_idle_prog(&prog, &regs, 100_000, false);
+        assert_eq!((on.0, on.1), (off.0, off.1));
     }
 
     // ------------------- tick_pio_and_route_irqs (lines 842, 852, 855, 860, 863) -------------------

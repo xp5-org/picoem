@@ -77,7 +77,10 @@ pub(crate) struct DecodedOp {
     ///   bit 2 — `is_thumb16_flag_only` (CMP/CMN/TST — always set flags
     ///           even inside an IT block; pre-computed to avoid a nested
     ///           match on every narrow-in-IT execution)
-    ///   bits 3..7 — reserved
+    ///   bit 3 — `is_sleepy`
+    ///   bit 4 — `is_idle_clean`
+    ///   bit 5 — `is_idle_store`
+    ///   bits 6..7 — reserved
     pub flags: u8,
 }
 
@@ -88,10 +91,16 @@ impl DecodedOp {
     /// BKPT or a hint, one of WFE / WFI / SEV / YIELD / NOP: a pure op that
     /// may halt or park its own core.
     pub(crate) const FLAG_SLEEPY: u8 = 0b0000_1000;
-    /// A plain load encoding: no store, no coprocessor, no exception return.
-    /// Lets the idle-loop detector accept impure ops that only read; the
-    /// read wrapper still vets each address.
-    pub(crate) const FLAG_IDLE_LOAD: u8 = 0b0001_0000;
+    /// A plain load or a register-only op that the pure fast path does not
+    /// take: no store, no coprocessor. Lets the idle-loop detector accept
+    /// impure ops that only read or move registers; the read wrapper still
+    /// vets each address, and an exception return marks the pass dirty.
+    pub(crate) const FLAG_IDLE_CLEAN: u8 = 0b0001_0000;
+    /// A plain store encoding: no exclusive, ordered or coprocessor store.
+    /// The idle-loop detector accepts it into a pass when the write lands in
+    /// plain SRAM; the pass only counts as idle if every byte it wrote holds
+    /// its starting value again at the end.
+    pub(crate) const FLAG_IDLE_STORE: u8 = 0b0010_0000;
 
     #[inline(always)]
     pub(crate) fn empty() -> Self {
@@ -125,8 +134,13 @@ impl DecodedOp {
     }
 
     #[inline(always)]
-    pub(crate) fn is_idle_load(&self) -> bool {
-        self.flags & Self::FLAG_IDLE_LOAD != 0
+    pub(crate) fn is_idle_clean(&self) -> bool {
+        self.flags & Self::FLAG_IDLE_CLEAN != 0
+    }
+
+    #[inline(always)]
+    pub(crate) fn is_idle_store(&self) -> bool {
+        self.flags & Self::FLAG_IDLE_STORE != 0
     }
 }
 
@@ -1337,6 +1351,10 @@ impl Bus {
         if !self.is_held_in_reset_bit(RESET_PWM) {
             self.pwm.tick(sys_clks, &self.clock_tree, &mut ext_irqs);
         }
+        // USBCTRL is level-sensitive: high while INTS is non-zero.
+        if !self.is_held_in_reset_bit(RESET_USBCTRL) && self.usbctrl.irq_level() {
+            ext_irqs |= 1u64 << crate::irq::IRQ_USBCTRL_IRQ;
+        }
         // POWMAN — AON timer; advance COUNT and pend TIMER IRQ on match.
         // HLD "2026.04.17 - HLD - RP2350 Coverage Gap Fill V11.md" §3.2.
         if !self.is_held_in_reset_bit(RESET_POWMAN) {
@@ -1380,6 +1398,33 @@ impl Bus {
         if self.watchdog.tick() {
             self.set_watchdog_reset();
         }
+    }
+
+    /// The USB controller, for a host model on the far end of the cable.
+    pub fn usb(&mut self) -> &mut crate::peripherals::usb::UsbCtrl {
+        &mut self.usbctrl
+    }
+
+    /// Plug a USB host in, or pull it out: VBUS follows.
+    pub fn usb_plug(&mut self, present: bool) {
+        self.usbctrl.set_host_present(present);
+    }
+
+    /// Advance a CDC host on the USB port to `now_us` of emulated time,
+    /// plugging it in on first use, and assert USBCTRL_IRQ if the
+    /// controller's interrupt is high afterwards. While the controller is
+    /// held in reset the device is not on the bus. Returns true when the
+    /// host touched the device.
+    pub fn usb_host_poll(&mut self, host: &mut picoem_common::usb::cdc_host::CdcHost, now_us: u64) -> bool {
+        self.usbctrl.set_host_present(true);
+        if self.is_held_in_reset_bit(RESET_USBCTRL) {
+            return false;
+        }
+        let touched = host.poll(&mut self.usbctrl, now_us);
+        if self.usbctrl.irq_level() {
+            self.assert_irq_shared(crate::irq::IRQ_USBCTRL_IRQ);
+        }
+        touched
     }
 
     /// Raise the IRQ lines encoded in `bits` via `assert_irq_shared`.
@@ -3694,6 +3739,22 @@ impl Default for Bus {
 use crate::core::bus_trait::CoreBus;
 
 impl CoreBus for Bus {
+    #[inline(always)]
+    fn sram_peek(&self, addr: u32, size: u32) -> Option<u32> {
+        // Plain alias only: the XOR, SET and CLR aliases in bits 24-25 modify.
+        if addr >> 24 != 0x20 {
+            return None;
+        }
+        let off = addr & 0x00FF_FFFF;
+        if off + size > SRAM_SIZE as u32 {
+            return None;
+        }
+        Some(match size {
+            1 => self.memory.sram_read8(off) as u32,
+            2 => self.memory.sram_read16(off) as u32,
+            _ => self.memory.sram_read32(off),
+        })
+    }
     #[inline(always)]
     fn read8(&mut self, addr: u32, core: u8) -> u8 {
         Bus::read8(self, addr, core)

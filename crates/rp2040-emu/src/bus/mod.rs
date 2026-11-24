@@ -103,6 +103,46 @@ pub const TIMER_BASE: u32 = 0x4005_4000;
 pub const WATCHDOG_BASE: u32 = 0x4005_8000;
 pub const XIP_CTRL_BASE: u32 = 0x1400_0000;
 pub const SSI_BASE: u32 = 0x1800_0000;
+/// Stores one idle-loop pass may make before it stops counting as idle.
+pub(crate) const IDLE_LOG_MAX: usize = 256;
+
+/// Idle-loop detector bookkeeping for the core that is stepping, kept on
+/// the bus because every data access passes through it. See
+/// [`crate::Emulator`]'s `idle_head_visit`.
+#[derive(Default)]
+pub(crate) struct IdleTrack {
+    /// A core is stepping with the detector on.
+    pub on: bool,
+    /// Something since the last loop head cannot be repeated for free.
+    pub dirty: bool,
+    /// A snapshot is live: SRAM stores are logged instead of dirtying.
+    pub logging: bool,
+    /// SRAM stores since the snapshot: offset, size, value overwritten.
+    pub log: Vec<(u32, u32, u32)>,
+    /// Scratch for the restore check.
+    bytes: Vec<(u32, u8)>,
+}
+
+/// True for reads the idle-loop detector may repeat: they have no side
+/// effect and cannot change within a quantum while the other core sleeps.
+/// ROM, XIP flash and XIP SRAM, SRAM, the TIMER raw counters, SIO CPUID,
+/// GPIO_IN and GPIO_HI_IN; also the spinlocks and the divider, whose state
+/// the detector compares itself.
+#[inline(always)]
+fn idle_clean_read(addr: u32) -> bool {
+    match addr >> 28 {
+        0x0 | 0x2 => true,
+        0x1 => matches!(addr >> 24, 0x10..=0x13 | 0x15),
+        0x4 => matches!(addr & !0x3000, a if a == TIMER_BASE + 0x24 || a == TIMER_BASE + 0x28),
+        0xD => matches!(addr & 0xFFF, 0x000 | 0x004 | 0x008 | 0x05C | 0x060..=0x078 | 0x100..=0x17F),
+        _ => false,
+    }
+}
+
+/// USB controller DPRAM, 4 KB, plain memory at every access width.
+pub const USBCTRL_DPRAM_BASE: u32 = 0x5010_0000;
+/// USB controller registers.
+pub const USBCTRL_REGS_BASE: u32 = 0x5011_0000;
 pub const XIP_SRAM_BASE: u32 = 0x1500_0000;
 pub const XIP_SRAM_END: u32 = 0x1500_4000; // 16 KB
 /// XIP flash window base. Aliases at `+0x0100_0000`, `+0x0200_0000`,
@@ -334,6 +374,10 @@ pub struct Bus {
     ssi_rx: VecDeque<u8>,
     /// Bytes sent to the flash since chip select went low.
     ssi_cmd: Vec<u8>,
+    /// Flash write-enable latch.
+    flash_wel: bool,
+    /// The page program in progress had write enable.
+    flash_prog: bool,
     /// Catch-all APB peripheral register backing store for blocks we
     /// don't model in detail (PSM / BUSCTRL / SYSCFG / IO_QSPI / PADS_QSPI /
     /// UART / SPI / I2C / ADC / PWM / TIMER / WATCHDOG / RTC / VREG / TBMAN).
@@ -360,6 +404,10 @@ pub struct Bus {
     pub(crate) spi0: SpiRegs,
     /// SPI1 — PL022-derived.
     pub(crate) spi1: SpiRegs,
+    /// USB controller, device mode.
+    pub(crate) usbctrl: picoem_common::usb::UsbCtrl,
+    /// Idle-loop detector bookkeeping.
+    pub(crate) idle: IdleTrack,
     /// I2C0 — DW_apb_i2c.
     pub(crate) i2c0: I2cRegs,
     /// I2C1 — DW_apb_i2c.
@@ -506,6 +554,8 @@ impl Bus {
             ssi_regs: HashMap::new(),
             ssi_rx: VecDeque::new(),
             ssi_cmd: Vec::new(),
+            flash_wel: false,
+            flash_prog: false,
             peripheral_regs: HashMap::new(),
             pio: [PioBlock::new(), PioBlock::new()],
             watchdog_tick: WatchdogTickRegs::new(),
@@ -514,6 +564,8 @@ impl Bus {
             uart1: UartRegs::new(IRQ_UART1_IRQ),
             spi0: SpiRegs::new(IRQ_SPI0_IRQ),
             spi1: SpiRegs::new(IRQ_SPI1_IRQ),
+            usbctrl: picoem_common::usb::UsbCtrl::new_rp2040(),
+            idle: IdleTrack::default(),
             i2c0: I2cRegs::new(IRQ_I2C0_IRQ),
             i2c1: I2cRegs::new(IRQ_I2C1_IRQ),
             adc: AdcRegs::new(IRQ_ADC_IRQ_FIFO),
@@ -775,6 +827,117 @@ impl Bus {
         self.uart0.drain_tx_log()
     }
 
+    /// Idle-loop detector: note a core data read.
+    #[inline(always)]
+    fn idle_read(&mut self, addr: u32) {
+        if self.idle.on && !idle_clean_read(addr) {
+            self.idle.dirty = true;
+        }
+    }
+
+    /// Idle-loop detector: note a core data write before it lands. Plain
+    /// SRAM stores are logged while a snapshot is live; spinlock releases
+    /// and divider operands are compared as state; anything else is a side
+    /// effect.
+    #[inline(always)]
+    fn idle_write(&mut self, addr: u32, size: u32) {
+        if !self.idle.on {
+            return;
+        }
+        match addr >> 28 {
+            0x2 => {
+                let off = addr & 0x00FF_FFFF;
+                if !self.idle.logging {
+                    return;
+                }
+                if (off + size) as usize <= SRAM_SIZE && self.idle.log.len() < IDLE_LOG_MAX {
+                    let old = match size {
+                        1 => self.memory.sram_read8(off) as u32,
+                        2 => self.memory.sram_read16(off) as u32,
+                        _ => self.memory.sram_read32(off),
+                    };
+                    self.idle.log.push((off, size, old));
+                } else {
+                    self.idle.dirty = true;
+                }
+            }
+            0xD if matches!(addr & 0xFFF, 0x060..=0x078 | 0x100..=0x17F) => {}
+            _ => self.idle.dirty = true,
+        }
+    }
+
+    /// Idle-loop detector: every byte stored since the snapshot holds its
+    /// snapshot value again, the first logged old value of each byte.
+    pub(crate) fn idle_memory_restored(&mut self) -> bool {
+        let bytes = &mut self.idle.bytes;
+        bytes.clear();
+        for &(off, size, old) in &self.idle.log {
+            for i in 0..size {
+                bytes.push((off + i, (old >> (8 * i)) as u8));
+            }
+        }
+        // A stable sort keeps each byte's first logged value first.
+        bytes.sort_by_key(|b| b.0);
+        bytes.dedup_by_key(|b| b.0);
+        bytes.iter().all(|&(a, v)| self.memory.sram_read8(a) == v)
+    }
+
+    /// State outside the core and SRAM that a clean pass may touch and the
+    /// idle-loop detector compares: the spinlock claim bits, `core`'s
+    /// divider, and both cores' event flags, which SEV sets.
+    pub(crate) fn idle_side_state(&self, core: usize) -> [u32; 9] {
+        let d = self.sio.divider(core);
+        [
+            self.sio.spinlock_bits(),
+            d.dividend,
+            d.divisor,
+            d.quotient,
+            d.remainder,
+            d.signed as u32 | (d.dirty as u32) << 1,
+            d.reads_pending as u32,
+            self.event_flag[0] as u32,
+            self.event_flag[1] as u32,
+        ]
+    }
+
+    /// The USB controller.
+    pub fn usb(&mut self) -> &mut picoem_common::usb::UsbCtrl {
+        &mut self.usbctrl
+    }
+
+    /// Plug a USB host into the port, or unplug it.
+    pub fn usb_plug(&mut self, present: bool) {
+        self.usbctrl.set_host_present(present);
+    }
+
+    /// Advance a USB host to `now_us` against the controller, and pend
+    /// USBCTRL_IRQ when the controller's interrupt is high afterwards.
+    /// While the controller is held in reset the device is not on the bus.
+    /// Returns true when the host touched the device.
+    pub fn usb_host_poll(&mut self, host: &mut picoem_common::usb::cdc_host::CdcHost, now_us: u64) -> bool {
+        self.usbctrl.set_host_present(true);
+        if peripheral_dispatch::is_held_in_reset(self, USBCTRL_REGS_BASE) {
+            return false;
+        }
+        let touched = host.poll(&mut self.usbctrl, now_us);
+        if self.usbctrl.irq_level() {
+            self.irq_pending |= 1 << crate::irq::IRQ_USBCTRL_IRQ;
+        }
+        touched
+    }
+
+    /// Wire an SPI device to SPI0 when `idx` is 0, else to SPI1.
+    pub fn attach_spi_device(&mut self, idx: usize, dev: Box<dyn crate::peripherals::spi::SpiDevice>) {
+        let spi = if idx == 0 { &mut self.spi0 } else { &mut self.spi1 };
+        spi.set_pins(self.sio.gpio_out as u64);
+        spi.attach_device(dev);
+    }
+
+    /// Unwire and return the device on SPI0 when `idx` is 0, else on SPI1.
+    pub fn detach_spi_device(&mut self, idx: usize) -> Option<Box<dyn crate::peripherals::spi::SpiDevice>> {
+        if idx == 0 { self.spi0.detach_device() } else { self.spi1.detach_device() }
+    }
+
     /// Feed one byte into UART0's receiver. False when it was dropped.
     pub fn uart0_push_rx(&mut self, byte: u8) -> bool {
         self.uart0.push_rx(byte, &mut self.irq_pending)
@@ -886,6 +1049,8 @@ impl Bus {
             SYSINFO_BASE => self.sysinfo_read(offset),
             CLOCKS_BASE => self.clocks_regs.read32(offset),
             RESETS_BASE => self.resets.read32(offset),
+            USBCTRL_REGS_BASE => self.usbctrl.read32(offset),
+            USBCTRL_DPRAM_BASE => self.usbctrl.read_dpram(offset, 4),
             XOSC_BASE => self.xosc_regs.read32(offset),
             PLL_SYS_BASE => pll_read_with_lock(
                 &self.pll_sys_regs,
@@ -937,7 +1102,17 @@ impl Bus {
                     self.recompute_clock_tree();
                 }
             }
-            RESETS_BASE => self.resets.write32(offset, val, alias),
+            RESETS_BASE => {
+                let was = self.resets.state;
+                self.resets.write32(offset, val, alias);
+                // Asserting USBCTRL's reset clears the controller.
+                let usb = 1u32 << peripheral_dispatch::RESET_USBCTRL;
+                if self.resets.state & usb != 0 && was & usb == 0 {
+                    self.usbctrl.reset();
+                }
+            }
+            USBCTRL_REGS_BASE => self.usbctrl.write32(offset, val, alias),
+            USBCTRL_DPRAM_BASE => self.usbctrl.write_dpram(offset, val, 4),
             XOSC_BASE => self.xosc_regs.write32(offset, val, alias),
             PLL_SYS_BASE => {
                 let old_regs = self.pll_sys_regs;
@@ -1072,12 +1247,55 @@ impl Bus {
 
     /// Serial NOR flash reply to one byte of a command, W25Q16-style:
     /// 0x03 read, 0x05/0x35 status, 0x4B unique ID, 0x9F JEDEC ID, 0xAB
-    /// release from power-down. Program and erase commands are accepted and
-    /// change nothing; the flash contents are the loaded image.
+    /// release from power-down, 0x06/0x04 write enable/disable, 0x02 page
+    /// program, 0x20/0x52/0xD8 4/32/64 KB erase and 0x60/0xC7 chip erase.
+    /// Program and erase need write enable, take effect at once and clear
+    /// it, so status never reports busy.
     fn flash_reply(&mut self, tx: u8) -> u8 {
         self.ssi_cmd.push(tx);
         let i = self.ssi_cmd.len() - 1;
         let cmd = self.ssi_cmd[0];
+        let addr = |a: &[u8]| (a[1] as u32) << 16 | (a[2] as u32) << 8 | a[3] as u32;
+        match cmd {
+            0x06 if i == 0 => self.flash_wel = true,
+            0x04 if i == 0 => self.flash_wel = false,
+            0x05 if i >= 1 => return (self.flash_wel as u8) << 1,
+            0x02 if i == 3 => {
+                // Code runs from SRAM while XIP is off, so one decode
+                // cache flush per command covers the bytes that follow.
+                self.flash_prog = self.flash_wel;
+                self.flash_wel = false;
+                self.pending_invalidation_regions |= invalidation_regions::XIP;
+            }
+            0x02 if i >= 4 && self.flash_prog => {
+                // A page program wraps within its 256-byte page.
+                let a = addr(&self.ssi_cmd);
+                let a = (a & !0xFF) | ((a + (i as u32 - 4)) & 0xFF);
+                self.memory.flash_program8(a & 0x00ff_ffff, tx);
+            }
+            0x20 | 0x52 | 0xD8 if i == 3 => {
+                if self.flash_wel {
+                    let len = match cmd {
+                        0x20 => 0x1000,
+                        0x52 => 0x8000,
+                        _ => 0x1_0000,
+                    };
+                    let a = addr(&self.ssi_cmd) & !(len - 1);
+                    self.memory.flash_erase(a & 0x00ff_ffff, len);
+                    self.pending_invalidation_regions |= invalidation_regions::XIP;
+                }
+                self.flash_wel = false;
+            }
+            0x60 | 0xC7 if i == 0 => {
+                if self.flash_wel {
+                    let n = self.memory.flash_size() as u32;
+                    self.memory.flash_erase(0, n);
+                    self.pending_invalidation_regions |= invalidation_regions::XIP;
+                }
+                self.flash_wel = false;
+            }
+            _ => {}
+        }
         match cmd {
             0x03 if i >= 4 => {
                 let a = &self.ssi_cmd;
@@ -1770,7 +1988,13 @@ impl Bus {
     fn sio_write32(&mut self, addr: u32, val: u32) {
         let offset = addr & 0xFFF;
         let core = self.active_core;
+        let out = self.sio.gpio_out;
         self.sio.write32(offset, val, core);
+        if self.sio.gpio_out != out {
+            let pins = self.sio.gpio_out as u64;
+            self.spi0.set_pins(pins);
+            self.spi1.set_pins(pins);
+        }
         if let Some(receiver) = self.sio.pending_fifo_event.take() {
             self.event_flag[receiver] = true;
         }
@@ -2025,6 +2249,10 @@ impl Bus {
         // PWM: per-slice counter advance + wrap-IRQ latch.
         self.pwm
             .tick(cycles, &self.clock_tree, &mut self.irq_pending);
+        // USB: level interrupt while INTS is non-zero.
+        if self.usbctrl.irq_level() && !peripheral_dispatch::is_held_in_reset(self, USBCTRL_REGS_BASE) {
+            self.irq_pending |= 1 << crate::irq::IRQ_USBCTRL_IRQ;
+        }
     }
 
     /// Fast-path lazy-schedule advance (HLD V7 §5.5).
@@ -2056,10 +2284,10 @@ impl Bus {
         self.timer.next_armed_inte_fire_cycle()
     }
 
-    /// Read the current pending-IRQ bitmap. Mostly for tests.
-    #[cfg(test)]
+    /// Read the current pending-IRQ bitmap, for tests and harness
+    /// diagnostics.
     #[inline]
-    pub(crate) fn irq_pending(&self) -> u32 {
+    pub fn irq_pending(&self) -> u32 {
         self.irq_pending
     }
 
@@ -2088,31 +2316,38 @@ use crate::core::CoreBus;
 impl CoreBus for Bus {
     #[inline(always)]
     fn read8(&mut self, addr: u32) -> u8 {
+        self.idle_read(addr);
         Bus::read8(self, addr)
     }
     #[inline(always)]
     fn read16(&mut self, addr: u32) -> u16 {
+        self.idle_read(addr);
         Bus::read16(self, addr)
     }
     #[inline(always)]
     fn read32(&mut self, addr: u32) -> u32 {
+        self.idle_read(addr);
         Bus::read32(self, addr)
     }
-
     #[inline(always)]
     fn write8(&mut self, addr: u32, val: u8) {
+        self.idle_write(addr, 1);
         Bus::write8(self, addr, val)
     }
     #[inline(always)]
     fn write16(&mut self, addr: u32, val: u16) {
+        self.idle_write(addr, 2);
         Bus::write16(self, addr, val)
     }
     #[inline(always)]
     fn write32(&mut self, addr: u32, val: u32) {
+        self.idle_write(addr, 4);
         Bus::write32(self, addr, val)
     }
-
     #[inline(always)]
+    fn idle_mark_dirty(&mut self) {
+        self.idle.dirty = true;
+    }
     fn set_active_pc(&mut self, pc: u32) {
         Bus::set_active_pc(self, pc)
     }
@@ -2330,6 +2565,76 @@ mod tests {
         bus.write32(SSI_BASE + 0x60, 0);
         bus.write32(SSI_BASE + 0x08, 0);
         assert_eq!(bus.read32(SSI_BASE + 0x24), 0);
+    }
+
+    /// USB controller registers are reset-gated on RESETS bit 24, DPRAM
+    /// takes every access width, and the USBCTRL line follows INTS.
+    #[test]
+    fn usbctrl_wiring() {
+        use picoem_common::usb::{INT_BUS_RESET, INTE, MAIN_CTRL, MAIN_CTRL_CONTROLLER_EN, SIE_CTRL, SIE_CTRL_PULLUP_EN};
+        let mut bus = Bus::new();
+        bus.write32(USBCTRL_REGS_BASE + MAIN_CTRL, 1);
+        assert_eq!(bus.read32(USBCTRL_REGS_BASE + MAIN_CTRL), 0, "held in reset");
+        bus.write32(0x4000_F000, 1 << peripheral_dispatch::RESET_USBCTRL);
+        bus.write32(USBCTRL_REGS_BASE + MAIN_CTRL, MAIN_CTRL_CONTROLLER_EN);
+        assert_eq!(bus.read32(USBCTRL_REGS_BASE + MAIN_CTRL), MAIN_CTRL_CONTROLLER_EN);
+        bus.write8(USBCTRL_DPRAM_BASE + 0x181, 0x22);
+        bus.write16(USBCTRL_DPRAM_BASE + 0x182, 0x4433);
+        bus.write8(USBCTRL_DPRAM_BASE + 0x180, 0x11);
+        assert_eq!(bus.read32(USBCTRL_DPRAM_BASE + 0x180), 0x4433_2211);
+        assert_eq!(bus.read8(USBCTRL_DPRAM_BASE + 0x182), 0x33);
+        bus.write32(USBCTRL_REGS_BASE + SIE_CTRL, SIE_CTRL_PULLUP_EN);
+        bus.write32(USBCTRL_REGS_BASE + INTE, INT_BUS_RESET);
+        bus.usb_plug(true);
+        bus.tick_peripherals(1);
+        assert_eq!(bus.irq_pending & (1 << crate::irq::IRQ_USBCTRL_IRQ), 0);
+        bus.usb().bus_reset();
+        bus.tick_peripherals(1);
+        assert_ne!(bus.irq_pending & (1 << crate::irq::IRQ_USBCTRL_IRQ), 0);
+        // Asserting the reset clears the controller.
+        bus.write32(0x4000_E000, 1 << peripheral_dispatch::RESET_USBCTRL);
+        bus.write32(0x4000_F000, 1 << peripheral_dispatch::RESET_USBCTRL);
+        assert_eq!(bus.read32(USBCTRL_REGS_BASE + INTE), 0);
+    }
+
+    /// Write enable, sector erase, page program with page wrap, and a
+    /// program without write enable that changes nothing.
+    #[test]
+    fn ssi_flash_program_and_erase() {
+        let mut bus = Bus::new();
+        bus.load_flash(&[0x5A; 0x3000]);
+        let xfer = |bus: &mut Bus, tx: &[u8]| -> Vec<u8> {
+            bus.write32(IO_QSPI_BASE + 0x0c, 0x300);
+            bus.write32(IO_QSPI_BASE + 0x0c, 0x200);
+            for &b in tx {
+                bus.write32(SSI_BASE + 0x60, b as u32);
+            }
+            (0..tx.len()).map(|_| bus.read32(SSI_BASE + 0x60) as u8).collect()
+        };
+        bus.write32(SSI_BASE + 0x08, 1);
+        // Erase needs write enable.
+        xfer(&mut bus, &[0x20, 0, 0x10, 0]);
+        assert_eq!(bus.read8(0x1000_1000), 0x5A);
+        xfer(&mut bus, &[0x06]);
+        assert_eq!(xfer(&mut bus, &[0x05, 0]), [0, 0x02], "WEL set");
+        xfer(&mut bus, &[0x20, 0, 0x10, 0x23]);
+        assert_eq!(xfer(&mut bus, &[0x05, 0]), [0, 0], "erase clears WEL");
+        assert_eq!(bus.read8(0x1000_0FFF), 0x5A);
+        assert_eq!(bus.read8(0x1000_1000), 0xFF);
+        assert_eq!(bus.read8(0x1000_1FFF), 0xFF);
+        assert_eq!(bus.read8(0x1000_2000), 0x5A);
+        // Program 3 bytes from 0x10FE: the third wraps to 0x1000.
+        xfer(&mut bus, &[0x06]);
+        xfer(&mut bus, &[0x02, 0, 0x10, 0xFE, 0x11, 0x22, 0x33]);
+        assert_eq!(bus.read8(0x1000_10FE), 0x11);
+        assert_eq!(bus.read8(0x1000_10FF), 0x22);
+        assert_eq!(bus.read8(0x1000_1000), 0x33);
+        // Programming only clears bits, and needs write enable.
+        xfer(&mut bus, &[0x02, 0, 0x10, 0x80, 0x00]);
+        assert_eq!(bus.read8(0x1000_1080), 0xFF);
+        xfer(&mut bus, &[0x06]);
+        xfer(&mut bus, &[0x02, 0, 0x10, 0xFE, 0xF0]);
+        assert_eq!(bus.read8(0x1000_10FE), 0x10);
     }
 
     #[test]

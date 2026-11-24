@@ -8,16 +8,14 @@
 //! [`super::Bus::peripheral_read32`] / `peripheral_write32` short-
 //! circuits before ever routing to the peripheral module.
 //!
-//! Bit numbering follows RP2040 datasheet §2.14 Table 26. TIMER (bit 21)
-//! and WATCHDOG (bit 24) have **separate** RESETS bits and are released
-//! independently. The 1 µs cadence coupling — WATCHDOG_TICK driving
-//! TIMER's microsecond heartbeat — is a runtime signalling relationship,
-//! not a RESETS-level one: firmware releases TIMER and WATCHDOG with two
-//! distinct CLR writes. Phase 3 adds ADC (bit 0) and PWM (bit 14).
+//! Bit numbering follows RP2040 datasheet §2.14 Table 26. TIMER is bit
+//! 21, and bit 24 is USBCTRL. The watchdog, with the tick generator that
+//! drives TIMER's microsecond heartbeat, has no RESETS bit and is never
+//! gated.
 
 use super::{
     ADC_BASE, Bus, DMA_BASE, I2C0_BASE, I2C1_BASE, PWM_BASE, SPI0_BASE, SPI1_BASE, TIMER_BASE,
-    UART0_BASE, UART1_BASE, WATCHDOG_BASE,
+    UART0_BASE, UART1_BASE, USBCTRL_REGS_BASE,
 };
 
 /// RESETS bit for the ADC peripheral (RP2040 datasheet §2.14 Table 26).
@@ -42,11 +40,9 @@ pub const RESET_UART0: u8 = 22;
 /// RESETS bit for UART1.
 pub const RESET_UART1: u8 = 23;
 
-/// RESETS bit for the watchdog + its tick divider (RP2040 datasheet §2.14
-/// Table 26). Independent of [`RESET_TIMER`] — the 1 µs cadence coupling
-/// between WATCHDOG_TICK and TIMER is a runtime signalling relationship,
-/// not a reset-bit one.
-pub const RESET_WATCHDOG: u8 = 24;
+/// RESETS bit for the USB controller. It gates the controller registers;
+/// the DPRAM stays readable and writable.
+pub const RESET_USBCTRL: u8 = 24;
 
 /// Map from peripheral base address to the RESETS bit that gates it.
 ///
@@ -69,7 +65,7 @@ pub static BASE_RESET_MAP: &[(u32, u8)] = &[
     (TIMER_BASE, RESET_TIMER),
     (UART0_BASE, RESET_UART0),
     (UART1_BASE, RESET_UART1),
-    (WATCHDOG_BASE, RESET_WATCHDOG),
+    (USBCTRL_REGS_BASE, RESET_USBCTRL),
 ];
 
 /// True iff the peripheral at `base` is currently held in RESETS.
@@ -97,35 +93,30 @@ pub(crate) fn is_held_in_reset(bus: &Bus, base: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bus::{Bus, TIMER_BASE, WATCHDOG_BASE};
+    use crate::bus::{Bus, TIMER_BASE, USBCTRL_REGS_BASE, WATCHDOG_BASE};
 
     #[test]
     fn fresh_bus_holds_timer_in_reset() {
         let bus = Bus::new();
-        // Default RESETS state holds everything.
+        // Default RESETS state holds everything that has a bit; the
+        // watchdog has none.
         assert!(is_held_in_reset(&bus, TIMER_BASE));
-        assert!(is_held_in_reset(&bus, WATCHDOG_BASE));
+        assert!(is_held_in_reset(&bus, USBCTRL_REGS_BASE));
+        assert!(!is_held_in_reset(&bus, WATCHDOG_BASE));
     }
 
     #[test]
-    fn timer_and_watchdog_have_separate_reset_bits() {
-        // Regression: RP2040 datasheet §2.14 Table 26 assigns TIMER to
-        // bit 21 and WATCHDOG to bit 24. Earlier drafts incorrectly
-        // gated TIMER on bit 24 (WATCHDOG_TICK's 1 µs cadence coupling
-        // is runtime-level, not reset-level). Releasing one must not
-        // release the other.
-
-        // Release only bit 21 (TIMER): TIMER unblocks, WATCHDOG still held.
+    fn timer_and_usbctrl_have_separate_reset_bits() {
+        // RP2040 datasheet §2.14 Table 26: TIMER is bit 21, USBCTRL bit 24.
         let mut bus = Bus::new();
         bus.write32(0x4000_F000, 1u32 << RESET_TIMER);
         assert!(!is_held_in_reset(&bus, TIMER_BASE));
-        assert!(is_held_in_reset(&bus, WATCHDOG_BASE));
+        assert!(is_held_in_reset(&bus, USBCTRL_REGS_BASE));
 
-        // Release only bit 24 (WATCHDOG): WATCHDOG unblocks, TIMER still held.
         let mut bus = Bus::new();
-        bus.write32(0x4000_F000, 1u32 << RESET_WATCHDOG);
+        bus.write32(0x4000_F000, 1u32 << RESET_USBCTRL);
         assert!(is_held_in_reset(&bus, TIMER_BASE));
-        assert!(!is_held_in_reset(&bus, WATCHDOG_BASE));
+        assert!(!is_held_in_reset(&bus, USBCTRL_REGS_BASE));
     }
 
     #[test]

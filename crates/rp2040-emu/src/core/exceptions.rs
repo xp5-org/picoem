@@ -52,6 +52,7 @@ impl CortexM0Plus {
     ///
     /// Cycle cost: ~16 (M0+ TRM).
     pub(crate) fn enter_exception<B: CoreBus>(&mut self, exc_num: u16, bus: &mut B) -> u32 {
+        bus.idle_mark_dirty();
         // Publish a sentinel "hardware-triggered exception stacking" PC so
         // the MMIO trace distinguishes the 8 stacking writes from the
         // faulting instruction's own access pattern. Value `0xFFFF_FFFE`
@@ -183,6 +184,7 @@ impl CortexM0Plus {
     /// writes a value with the EXC_RETURN pattern. Validates the magic
     /// and selects the target stack.
     pub(crate) fn exit_exception<B: CoreBus>(&mut self, exc_return: u32, bus: &mut B) -> u32 {
+        bus.idle_mark_dirty();
         // Publish a sentinel "exception-return unstacking" PC so the
         // MMIO trace distinguishes the 8 unstacking reads from ordinary
         // instruction-driven access. Value `0xFFFF_FFFD` is paired with

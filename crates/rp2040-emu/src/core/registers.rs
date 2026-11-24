@@ -18,6 +18,7 @@ pub const XPSR_T: u32 = 1 << 24;
 /// so S0-S31 / FPSCR are absent — giving a much smaller footprint than
 /// the M33 register file.
 #[repr(C)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct Registers {
     /// R0-R12, SP (R13), LR (R14), PC (R15).
     pub r: [u32; 16],

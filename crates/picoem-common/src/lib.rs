@@ -17,6 +17,7 @@ pub mod pio;
 // the queue/barrier primitives are portable and remain available for
 // serial-state scaffolding on non-threaded hosts.
 pub mod threaded;
+pub mod usb;
 
 pub use self::clock::Clock;
 pub use self::clocks::{ClockTree, ROSC_FREQ_HZ, XOSC_FREQ_HZ, pll_output_hz};

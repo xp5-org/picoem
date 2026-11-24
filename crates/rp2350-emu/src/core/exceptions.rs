@@ -242,6 +242,7 @@ impl CortexM33 {
 
     /// Pop exception frame, restore mode. Returns cycle cost (~12).
     pub(crate) fn exit_exception<B: CoreBus>(&mut self, exc_return: u32, bus: &mut B) -> u32 {
+        self.idle_dirty = true;
         // Publish a sentinel "exception-return unstacking" PC so the
         // MMIO trace distinguishes the unstacking reads from ordinary
         // instruction-driven access. Value `0xFFFF_FFFD` is paired with

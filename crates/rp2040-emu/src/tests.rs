@@ -2498,7 +2498,7 @@ mod pll_lock {
 // §5.5 (fast-path gate with DMA + peripherals + IRQ), and the PIO →
 // NVIC routing helper in `Emulator::tick_pio_and_route_irqs_single`.
 mod phase1_wave1 {
-    use crate::bus::peripheral_dispatch::{RESET_WATCHDOG, is_held_in_reset};
+    use crate::bus::peripheral_dispatch::is_held_in_reset;
     use crate::bus::{Bus, PIO0_BASE, PIO1_BASE, TIMER_BASE, WATCHDOG_BASE};
     use crate::irq::{IRQ_PIO0_IRQ_0, IRQ_PIO1_IRQ_0, IRQ_TIMER_IRQ_0};
     use crate::peripherals::watchdog_tick::TICK_OFFSET;
@@ -2557,23 +2557,10 @@ mod phase1_wave1 {
     }
 
     #[test]
-    fn watchdog_tick_write_swallowed_while_held_in_reset() {
+    fn watchdog_tick_write_honoured_with_everything_in_reset() {
+        // The watchdog has no RESETS bit: WATCHDOG_TICK takes writes while
+        // every gated peripheral is still held.
         let mut bus = Bus::new();
-        // Default RESETS holds bit 24 (WATCHDOG) — writing to
-        // WATCHDOG_TICK must be a no-op.
-        bus.write32(WATCHDOG_BASE + TICK_OFFSET, 0x0000_03FF);
-        assert_eq!(
-            bus.watchdog_tick.cycles, 12,
-            "CYCLES stays at reset default"
-        );
-        assert!(!bus.watchdog_tick.enable);
-    }
-
-    #[test]
-    fn watchdog_tick_write_honoured_after_reset_released() {
-        let mut bus = Bus::new();
-        // CLR RESETS bit 24 (WATCHDOG) via the alias at 0x4000_F000.
-        bus.write32(0x4000_F000, 1u32 << RESET_WATCHDOG);
         // Write CYCLES = 0x41, ENABLE = 1.
         bus.write32(WATCHDOG_BASE + TICK_OFFSET, 0x0000_0241);
         assert_eq!(bus.watchdog_tick.cycles, 0x41);

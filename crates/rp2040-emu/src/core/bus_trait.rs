@@ -37,6 +37,11 @@ use crate::bus::ppb::Ppb;
 use crate::core::Nvic;
 
 pub trait CoreBus {
+    /// The op just run did something the idle-loop detector must not
+    /// skip over: an exception entry or return, or a hint.
+    #[inline(always)]
+    fn idle_mark_dirty(&mut self) {}
+
     // --- Memory access ------------------------------------------------
     //
     // Address-only (no `core` argument) — matches the existing RP2040

@@ -308,6 +308,9 @@ pub(crate) fn idle_clean_read(addr: u32) -> bool {
     }
 }
 
+/// Stores one idle-loop pass may make before it stops counting as idle.
+const IDLE_LOG_MAX: usize = 32;
+
 /// Cortex-M33 CPU core.
 pub struct CortexM33 {
     pub regs: Registers,
@@ -328,14 +331,25 @@ pub struct CortexM33 {
     /// The op just run was BKPT or a hint.
     pub(crate) last_op_sleepy: bool,
     /// The op just run was a plain load encoding.
-    pub(crate) last_op_idle_load: bool,
+    pub(crate) last_op_idle_clean: bool,
+    /// The op just run was a plain store encoding.
+    pub(crate) last_op_idle_store: bool,
+    /// The op just run wrote somewhere the idle-loop store log cannot
+    /// track: outside plain SRAM, or past the log's capacity.
+    pub(crate) op_store_changed: bool,
+    /// Idle-loop detector: a snapshot is live, so plain SRAM stores are
+    /// logged in `idle_log` instead of dirtying the pass.
+    pub(crate) idle_tracking: bool,
+    /// Stores since the snapshot: address, size and the value overwritten.
+    pub(crate) idle_log: Vec<(u32, u32, u32)>,
     /// Idle-loop detector: set when the current loop iteration did anything
     /// that could make iterations differ or have effects: a store, a
     /// side-effecting read, an exception, a hint or a coprocessor op.
     pub(crate) idle_dirty: bool,
     /// Idle-loop detector snapshot at the last loop-head visit.
     pub(crate) idle_snap: Option<Box<IdleSnap>>,
-    /// Failed snapshot compares this slice; the detector backs off after a few.
+    /// Snapshots taken plus failed compares this slice; the detector backs
+    /// off after a few.
     pub(crate) idle_fails: u8,
     /// Enables the exact idle-loop skip in the Serial scheduler, default on.
     /// Off executes every iteration, for A/B checks.
@@ -477,7 +491,11 @@ impl CortexM33 {
             current_instr_addr: 0,
             last_op_pure: false,
             last_op_sleepy: false,
-            last_op_idle_load: false,
+            last_op_idle_clean: false,
+            last_op_idle_store: false,
+            op_store_changed: false,
+            idle_tracking: false,
+            idle_log: Vec::with_capacity(IDLE_LOG_MAX),
             idle_dirty: true,
             idle_snap: None,
             idle_fails: 0,
@@ -648,10 +666,12 @@ impl CortexM33 {
             return true;
         }
 
+        self.op_store_changed = false;
         let mut cycles = self.decode_execute(bus);
 
         let mut check = !self.last_op_pure || self.last_op_sleepy;
-        if check && !(self.last_op_idle_load && !self.last_op_sleepy) {
+        let idle_op = self.last_op_idle_clean || (self.last_op_idle_store && !self.op_store_changed);
+        if check && !(idle_op && !self.last_op_sleepy) {
             self.idle_dirty = true;
         }
         if !self.last_op_pure {
@@ -696,28 +716,45 @@ impl CortexM33 {
     }
 
     /// Idle-loop skip for the Serial scheduler, called when the core has just
-    /// branched backwards to `pc`, a loop head. An iteration is clean when it
-    /// did only side-effect-free, slice-constant reads and no stores,
-    /// exceptions, hints or coprocessor ops. If the iteration that just ended
-    /// was clean and the architectural state equals the state at the previous
-    /// visit, every further iteration in this slice is identical: nothing else
-    /// can change what it reads until the quantum ends. Skip as many whole
-    /// iterations as fit before `target`, advancing `cycles` and the counters
-    /// exactly as executing them would. The remainder runs normally, so the
-    /// result is bit-identical.
-    pub(crate) fn idle_head_visit(&mut self, pc: u32, target: u64) {
+    /// branched backwards to `pc`, a loop head. Calls and returns to lower
+    /// addresses count as heads too, so one pass of a poll loop can cross
+    /// several heads. An op is clean when it is pure, a side-effect-free
+    /// slice-constant read, a register-only op, or a plain SRAM store, which
+    /// goes in the store log; other stores, side-effecting reads,
+    /// exceptions, hints and coprocessor ops are not.
+    ///
+    /// After a clean stretch the detector snapshots the state at a head and
+    /// keeps it while every op stays clean. Back at the snapshot's head with
+    /// the same architectural state and every logged byte holding its
+    /// snapshot value again, the core has made a full pass that changed
+    /// nothing, so every further pass is identical: nothing else can change
+    /// what it reads until the quantum ends. Skip as many whole passes as
+    /// fit before `target`, advancing `cycles` and the counters exactly as
+    /// executing them would. The remainder runs normally, so the result is
+    /// bit-identical.
+    pub(crate) fn idle_head_visit<B: CoreBus>(&mut self, pc: u32, target: u64, bus: &B) {
+        const MAX_FAILS: u8 = 12;
         let clean = !self.idle_dirty;
         self.idle_dirty = false;
-        if let Some(s) = self.idle_snap.as_deref() {
-            if clean
-                && s.pc == pc
-                && self.pending_fault.is_none()
+        if !clean {
+            self.idle_drop_snapshot();
+            return;
+        }
+        if self.idle_tracking {
+            let s = self.idle_snap.as_deref().unwrap();
+            // The same head from another call site or stack depth is a
+            // different point in the pass, not a repeat.
+            if s.pc != pc || s.regs.r[13] != self.regs.r[13] || s.regs.r[14] != self.regs.r[14] {
+                return; // another head inside the same clean stretch
+            }
+            if self.pending_fault.is_none()
                 && self.it_state == s.it_state
                 && self.exclusive_address == s.exclusive_address
                 && self.secure == s.secure
                 && self.dcp_status == s.dcp_status
                 && self.dcp_halves == s.dcp_halves
                 && regs_identical(&self.regs, &s.regs)
+                && self.idle_memory_restored(bus)
             {
                 let iter = self.cycles - s.cycles;
                 if iter > 0 && self.cycles < target {
@@ -750,22 +787,26 @@ impl CortexM33 {
                         self.counters.idle_skipped_cycles += iter * k;
                     }
                 }
-                // The state is unchanged: keep the snapshot, re-based on now.
+                // Registers and memory equal the snapshot: keep it, re-based
+                // on now, with an empty log.
                 let s = self.idle_snap.as_deref_mut().unwrap();
                 s.cycles = self.cycles;
                 s.counters = self.counters.clone();
+                self.idle_log.clear();
                 return;
             }
-        }
-        if !clean {
-            return; // nothing to compare against next time either
-        }
-        if self.idle_fails >= 4 {
-            return; // back off for the rest of this slice
-        }
-        if self.idle_snap.is_some() {
+            // Same point in the pass, different state: re-take the snapshot
+            // here, since scratch registers left over from before it are
+            // the usual difference.
             self.idle_fails += 1;
         }
+        // Every snapshot costs a clone and every miss a compare, so a slice
+        // whose loops never repeat backs off after a few.
+        if self.idle_fails >= MAX_FAILS {
+            self.idle_drop_snapshot();
+            return;
+        }
+        self.idle_fails += 1;
         let snap = IdleSnap {
             pc,
             regs: self.regs.clone(),
@@ -781,6 +822,50 @@ impl CortexM33 {
             Some(s) => *s = snap,
             None => self.idle_snap = Some(Box::new(snap)),
         }
+        self.idle_tracking = true;
+        self.idle_log.clear();
+    }
+
+    /// Log a store for the idle-loop detector while a snapshot is live. A
+    /// store it cannot log makes the op dirty.
+    #[inline(always)]
+    fn idle_log_store<B: CoreBus>(&mut self, addr: u32, size: u32, bus: &B) {
+        if !self.idle_tracking {
+            return;
+        }
+        match bus.sram_peek(addr, size) {
+            Some(old) if self.idle_log.len() < IDLE_LOG_MAX => self.idle_log.push((addr, size, old)),
+            _ => self.op_store_changed = true,
+        }
+    }
+
+    /// True when every byte stored since the snapshot holds its snapshot
+    /// value again: the first logged old value of each byte.
+    fn idle_memory_restored<B: CoreBus>(&self, bus: &B) -> bool {
+        let mut seen: Vec<u32> = Vec::with_capacity(self.idle_log.len() * 4);
+        for &(addr, size, old) in &self.idle_log {
+            for i in 0..size {
+                let a = addr.wrapping_add(i);
+                if seen.contains(&a) {
+                    continue;
+                }
+                seen.push(a);
+                if bus.sram_peek(a, 1) != Some((old >> (8 * i)) & 0xFF) {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    /// Drop the snapshot: the stretch since it is no longer side-effect free.
+    #[inline(always)]
+    fn idle_drop_snapshot(&mut self) {
+        if let Some(s) = self.idle_snap.as_deref_mut() {
+            s.pc = u32::MAX;
+        }
+        self.idle_tracking = false;
+        self.idle_log.clear();
     }
 
     /// Reset the idle-loop detector at a slice boundary: memory, pins and
@@ -789,9 +874,7 @@ impl CortexM33 {
     pub(crate) fn idle_slice_start(&mut self) {
         self.idle_dirty = true;
         self.idle_fails = 0;
-        if let Some(s) = self.idle_snap.as_deref_mut() {
-            s.pc = u32::MAX;
-        }
+        self.idle_drop_snapshot();
     }
 
     /// Debug step: clears halted/wfe_waiting before stepping.
@@ -1108,6 +1191,7 @@ impl CortexM33 {
 
     pub(crate) fn bus_write32<B: CoreBus>(&mut self, addr: u32, val: u32, bus: &mut B) {
         self.counters.classify_access(addr, true);
+        self.idle_log_store(addr, 4, bus);
         // Phase 0b.2: any data-side write invalidates a peer core's
         // exclusive monitor. `Emulator::step` snoops this flag after the
         // core's quantum slice and clears the peer's `exclusive_address`.
@@ -1175,6 +1259,7 @@ impl CortexM33 {
 
     pub(crate) fn bus_write16<B: CoreBus>(&mut self, addr: u32, val: u16, bus: &mut B) {
         self.counters.classify_access(addr, true);
+        self.idle_log_store(addr, 2, bus);
         // Phase 0b.2: see `bus_write32` for the monitor-invalidation rationale.
         self.did_write_this_quantum = true;
         if self.peer_reservation == Some(addr & !3) {
@@ -1238,6 +1323,7 @@ impl CortexM33 {
 
     pub(crate) fn bus_write8<B: CoreBus>(&mut self, addr: u32, val: u8, bus: &mut B) {
         self.counters.classify_access(addr, true);
+        self.idle_log_store(addr, 1, bus);
         // Phase 0b.2: see `bus_write32` for the monitor-invalidation rationale.
         self.did_write_this_quantum = true;
         if self.peer_reservation == Some(addr & !3) {

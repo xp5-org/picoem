@@ -1485,7 +1485,7 @@ fn step_pair_arm(cs: &mut [CortexM33; 2], bus: &mut Bus, target: u64) {
             let pc1 = cs[core_id].regs.pc();
             if pc1 < pc0 && cs[core_id].idle_skip {
                 // Backward branch: loop head. See CortexM33::idle_head_visit.
-                cs[core_id].idle_head_visit(pc1, target);
+                cs[core_id].idle_head_visit(pc1, target, bus);
             }
             if !check {
                 continue;
@@ -2905,6 +2905,92 @@ mod stage8_lib_residue {
         }
         // Without it, a large quantum fires late; this checks the test itself.
         assert!(fire_cycle(4096, false) > exact);
+    }
+
+    /// Core 0 runs `prog` from SRAM 0x2000_1000 with `regs` preset and core 1
+    /// halted, for `cycles` cycles in 4096-cycle quanta. Returns the final
+    /// registers, cycle count, the word at 0x2000_0100 and the idle-skipped
+    /// cycles.
+    fn run_idle_prog(prog: &[u16], regs: &[(usize, u32)], cycles: u64, skip: bool) -> ([u32; 16], u64, u32, u64) {
+        let mut emu = Emulator::new(Config::default());
+        emu.bus.atomics.set_halted(1);
+        for (i, hw) in prog.iter().enumerate() {
+            emu.bus.write16(0x2000_1000 + 2 * i as u32, *hw, 0);
+        }
+        emu.step_quantum = 4096;
+        let c = emu.core_mut(0);
+        c.idle_skip = skip;
+        c.regs.faultmask = 0;
+        c.regs.primask = 0;
+        c.regs.r[13] = 0x2000_2000;
+        c.regs.msp = 0x2000_2000;
+        for &(r, v) in regs {
+            c.regs.r[r] = v;
+        }
+        c.regs.set_pc(0x2000_1000);
+        emu.run(cycles).unwrap();
+        let mem = emu.bus.read32(0x2000_0100, 0);
+        let c = emu.core(0);
+        (c.regs.r, emu.cycles(), mem, c.counters.idle_skipped_cycles)
+    }
+
+    /// A poll loop whose calls push different registers into the same stack
+    /// slots changes memory on every store, but each pass leaves it as it
+    /// found it. The idle skip collapses it and the result is bit-identical.
+    #[test]
+    fn idle_skip_collapses_pass_that_restores_its_stack() {
+        let prog = [
+            0x47A8, // 1000: blx r5     -> f
+            0x47B0, // 1002: blx r6     -> g
+            0xE7FC, // 1004: b 1000
+            0xBF00, // 1006: nop, not reached
+            0xB510, // 1008: f: push {r4, lr}
+            0xBD10, // 100A:    pop {r4, pc}
+            0xB508, // 100C: g: push {r3, lr}
+            0xBD08, // 100E:    pop {r3, pc}
+        ];
+        let regs = [(3, 0x33), (4, 0x44), (5, 0x2000_1009), (6, 0x2000_100D)];
+        let on = run_idle_prog(&prog, &regs, 400_000, true);
+        let off = run_idle_prog(&prog, &regs, 400_000, false);
+        assert_eq!(on.0, off.0, "registers");
+        assert_eq!(on.1, off.1, "cycles");
+        assert_eq!(off.3, 0);
+        assert!(on.3 > 300_000, "skipped only {} of 400000 cycles", on.3);
+    }
+
+    /// A pass that leaves memory changed is never skipped, even when the
+    /// registers repeat.
+    #[test]
+    fn idle_skip_keeps_pass_that_changes_memory() {
+        let prog = [
+            0x6808, // 1000: ldr r0, [r1]
+            0x3001, // 1002: adds r0, #1
+            0x6008, // 1004: str r0, [r1]
+            0x2000, // 1006: movs r0, #0
+            0xE7FA, // 1008: b 1000
+        ];
+        let regs = [(1, 0x2000_0100)];
+        let on = run_idle_prog(&prog, &regs, 100_000, true);
+        let off = run_idle_prog(&prog, &regs, 100_000, false);
+        assert_eq!(on.3, 0, "a counting loop must not be skipped");
+        assert_eq!((on.0, on.1, on.2), (off.0, off.1, off.2));
+        assert!(on.2 > 1000, "the loop ran: count {}", on.2);
+    }
+
+    /// A store outside plain SRAM, here the SRAM XOR alias, is a side effect
+    /// even when the pass looks the same.
+    #[test]
+    fn idle_skip_keeps_pass_with_alias_store() {
+        let prog = [
+            0x6008, // 1000: str r0, [r1]  (XOR alias: flips the word)
+            0x6008, // 1002: str r0, [r1]  (flips it back)
+            0xE7FC, // 1004: b 1000
+        ];
+        let regs = [(0, 0xFFFF_FFFF), (1, 0x2100_0100)];
+        let on = run_idle_prog(&prog, &regs, 100_000, true);
+        let off = run_idle_prog(&prog, &regs, 100_000, false);
+        assert_eq!(on.3, 0);
+        assert_eq!((on.0, on.1, on.2), (off.0, off.1, off.2));
     }
 
     // ------------------- core_riscv accessor on RiscV emulator -------------------

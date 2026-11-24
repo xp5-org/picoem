@@ -166,6 +166,28 @@ impl Memory {
         }
     }
 
+    /// NOR page program of one byte: bits can only go from 1 to 0.
+    pub fn flash_program8(&mut self, offset: u32, val: u8) {
+        if let Some(b) = self.xip.get_mut(offset as usize) {
+            *b &= val;
+        }
+    }
+
+    /// NOR erase: `len` bytes from `offset` read 0xFF.
+    pub fn flash_erase(&mut self, offset: u32, len: u32) {
+        let n = self.xip.len();
+        let a = (offset as usize).min(n);
+        let b = (offset as usize + len as usize).min(n);
+        for v in &mut self.xip[a..b] {
+            *v = 0xFF;
+        }
+    }
+
+    /// The whole flash buffer, for saving it between runs.
+    pub fn flash(&self) -> &[u8] {
+        &self.xip
+    }
+
     pub fn xip_read8(&self, offset: u32) -> u8 {
         self.xip.get(offset as usize).copied().unwrap_or(0)
     }

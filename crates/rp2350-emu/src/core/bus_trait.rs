@@ -57,6 +57,14 @@ pub trait CoreBus {
     #[inline(always)]
     fn note_code_fetch(&mut self, _pc: u32) {}
 
+    /// The `size`-byte value at `addr` when it is plain SRAM, read with no
+    /// side effect and no wait states; `None` for anything else. The
+    /// idle-loop detector uses it to spot stores that change nothing.
+    #[inline(always)]
+    fn sram_peek(&self, _addr: u32, _size: u32) -> Option<u32> {
+        None
+    }
+
     fn bus_fault(&self, core: u8) -> bool;
     fn bus_fault_addr(&self, core: u8) -> u32;
     fn clear_bus_fault(&mut self, core: u8);

@@ -142,6 +142,7 @@ impl CortexM0Plus {
     /// See `wrk_docs/2026.04.26 - HLD - RP2040 WFE-SEV Wake Mechanics
     /// V1.md` §4.2.
     pub(crate) fn wfe<B: CoreBus>(&mut self, bus: &mut B) {
+        bus.idle_mark_dirty();
         let core = self.core_id as usize;
         if bus.consume_event_flag(core) {
             // Latched event consumed; do not park.
@@ -272,7 +273,15 @@ impl CortexM0Plus {
         // Pre-fetch exception poll + dispatch (PendSV / SysTick / external
         // IRQ, all arbitrated in one pass). Returns the cycle cost of
         // exception entry if one was taken; `0` otherwise.
-        let exc_cycles = self.try_take_any_pending_exception(bus);
+        // Nothing pending is the common case: two loads and no arbitration.
+        let core = self.core_id as usize;
+        let exc_cycles = if bus.ppb(core).icsr & (1 << 28 | 1 << 26) == 0
+            && bus.nvic(core).pending_and_enabled() == 0
+        {
+            0
+        } else {
+            self.try_take_any_pending_exception(bus)
+        };
         if exc_cycles != 0 {
             self.cycles = self.cycles.wrapping_add(exc_cycles as u64);
             return exc_cycles;
