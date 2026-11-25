@@ -12,6 +12,7 @@
 //! no CBZ/CBNZ, no security state, no FP, no MPU, no wide-path handling
 //! from inside Thumb-16.
 
+pub mod block;
 pub mod bus_trait;
 pub(crate) mod decode;
 pub(crate) mod exceptions;

@@ -115,12 +115,206 @@ pub(crate) struct IdleTrack {
     pub on: bool,
     /// Something since the last loop head cannot be repeated for free.
     pub dirty: bool,
+    /// The dirt includes an exception entry or return, or a hint: the
+    /// stretch was interrupted, which says nothing about the loop itself.
+    pub event: bool,
+    /// An exception was entered or returned from since the last loop head.
+    pub exception: bool,
     /// A snapshot is live: SRAM stores are logged instead of dirtying.
     pub logging: bool,
-    /// SRAM stores since the snapshot: offset, size, value overwritten.
-    pub log: Vec<(u32, u32, u32)>,
-    /// Scratch for the restore check.
-    bytes: Vec<(u32, u8)>,
+    /// SRAM words stored since the snapshot: offset and the value before
+    /// the first store to it.
+    log: Vec<(u32, u32)>,
+    /// Open-addressed index of `log` by offset plus 1, 0 for an empty
+    /// slot. Allocated on first use.
+    log_tab: Vec<u32>,
+    /// Watch mode: the other core is running, so a clean pass may make no
+    /// stores and only reads the other core cannot change without the bus
+    /// seeing it. Those reads are recorded so the pass can be parked.
+    pub watch: bool,
+    /// Watch mode: SRAM words read or stored since the snapshot.
+    pub words: Vec<u32>,
+    /// Open-addressed index of `words`, 0 for an empty slot, so a lookup
+    /// does not scan the list. Allocated on first use.
+    word_tab: Vec<u32>,
+    /// Watch mode: the pass stored to SRAM.
+    pub stored: bool,
+    /// Watch mode: the pass read a TIMER raw counter, which moves every
+    /// quantum, so a park on it ends with the quantum.
+    pub timer: bool,
+    /// Watch mode: peripheral blocks a pass read status from or used, as
+    /// [`PARK_PIO0`] and the other `PARK_*` bits.
+    pub pio: u8,
+    /// Watch mode: SIO GPIO_IN or GPIO_HI_IN was read.
+    pub gpio: bool,
+    /// Diagnostic, off by default: when on, every address that made a pass
+    /// dirty is appended to `dirty_log`, capped at 1 << 20 entries.
+    pub debug_dirty: bool,
+    pub dirty_log: Vec<(u32, bool)>,
+}
+
+/// `pio` bits of [`IdleTrack`] and [`ParkWatch`]: PIO0 or PIO1 FSTAT or
+/// FLEVEL read, UART0 or UART1 UARTFR read, a spinlock claimed and
+/// released.
+pub(crate) const PARK_PIO0: u8 = 1;
+pub(crate) const PARK_UART0: u8 = 4;
+pub(crate) const PARK_SPINLOCK: u8 = 16;
+
+/// SRAM words one parked pass may depend on.
+pub(crate) const PARK_WORDS_MAX: usize = 64;
+
+/// Slots in [`IdleTrack`]'s word index: four per word, so probes stay
+/// short.
+const WORD_TAB: usize = 4 * PARK_WORDS_MAX;
+
+/// Slots in [`IdleTrack`]'s store log index.
+const LOG_TAB: usize = 2 * IDLE_LOG_MAX;
+
+impl IdleTrack {
+    /// Adds SRAM word `w` to `words` unless it is there already; false
+    /// when it is new and the list is full.
+    #[inline]
+    fn note_word(&mut self, w: u32) -> bool {
+        if self.word_tab.is_empty() {
+            self.word_tab = vec![0; WORD_TAB];
+        }
+        let mut i = (w >> 2) as usize & (WORD_TAB - 1);
+        loop {
+            let e = self.word_tab[i];
+            if e == w {
+                return true;
+            }
+            if e == 0 {
+                break;
+            }
+            i = (i + 1) & (WORD_TAB - 1);
+        }
+        if self.words.len() >= PARK_WORDS_MAX {
+            return false;
+        }
+        self.word_tab[i] = w;
+        self.words.push(w);
+        true
+    }
+
+    /// Logs SRAM word `off`, whose value is `old()`, unless a store to it
+    /// is logged already; false when it is new and the log is full.
+    #[inline]
+    fn log_word(&mut self, off: u32, old: impl FnOnce() -> u32) -> bool {
+        if self.log_tab.is_empty() {
+            self.log_tab = vec![0; LOG_TAB];
+        }
+        let mut i = (off >> 2) as usize & (LOG_TAB - 1);
+        loop {
+            let e = self.log_tab[i];
+            if e == off + 1 {
+                return true;
+            }
+            if e == 0 {
+                break;
+            }
+            i = (i + 1) & (LOG_TAB - 1);
+        }
+        if self.log.len() >= IDLE_LOG_MAX {
+            return false;
+        }
+        self.log_tab[i] = off + 1;
+        self.log.push((off, old()));
+        true
+    }
+
+    /// Empties the store log and its index.
+    pub(crate) fn clear_log(&mut self) {
+        if !self.log_tab.is_empty() {
+            for &(off, _) in &self.log {
+                let mut i = (off >> 2) as usize & (LOG_TAB - 1);
+                while self.log_tab[i] != off + 1 {
+                    i = (i + 1) & (LOG_TAB - 1);
+                }
+                self.log_tab[i] = 0;
+            }
+        }
+        self.log.clear();
+    }
+
+    /// Whether SRAM word `w` is in `words`.
+    #[inline]
+    fn has_word(&self, w: u32) -> bool {
+        if self.word_tab.is_empty() {
+            return false;
+        }
+        let mut i = (w >> 2) as usize & (WORD_TAB - 1);
+        loop {
+            let e = self.word_tab[i];
+            if e == w {
+                return true;
+            }
+            if e == 0 {
+                return false;
+            }
+            i = (i + 1) & (WORD_TAB - 1);
+        }
+    }
+
+    /// Empties `words` and its index.
+    pub(crate) fn clear_words(&mut self) {
+        if !self.word_tab.is_empty() {
+            for &w in &self.words {
+                let mut i = (w >> 2) as usize & (WORD_TAB - 1);
+                while self.word_tab[i] != w {
+                    i = (i + 1) & (WORD_TAB - 1);
+                }
+                self.word_tab[i] = 0;
+            }
+        }
+        self.words.clear();
+    }
+}
+
+/// What a parked core's polling pass reads, checked against the running
+/// core's accesses. `hit` is set by the first access that could change one
+/// of those reads; the emulator then unparks the core.
+#[derive(Default, Clone)]
+pub(crate) struct ParkWatch {
+    pub active: bool,
+    /// The pass also stored to SRAM, restoring every byte; its words are in
+    /// `words`, so another core reading them conflicts too.
+    pub stored: bool,
+    pub words: Vec<u32>,
+    pub pio: u8,
+    pub gpio: bool,
+    pub hit: bool,
+    /// The pass read the TIMER: the park ends with the quantum.
+    pub timer: bool,
+    /// [`Bus::park_fingerprint`] at park time, compared at each quantum
+    /// boundary to decide whether the park carries over.
+    pub vals: Vec<u32>,
+}
+
+/// Whether an access by the running core could change what a watch-mode
+/// pass of the other core reads: a store to one of its SRAM words, or a
+/// read of one it stored, as `word` says; any access to a PIO block it
+/// polls other than the status registers, or to a UART it polls other
+/// than UARTFR; a spinlock access while it uses spinlocks; a GPIO output
+/// change while it reads GPIO_IN; or a FIFO write that raises its SIO
+/// interrupt.
+#[inline(always)]
+fn watch_conflict(addr: u32, write: bool, pio: u8, gpio: bool, word: impl FnOnce(u32) -> bool) -> bool {
+    match addr >> 28 {
+        0x2 => word(addr & !3),
+        0x5 if (addr >> 20) & 0xFFE == 0x502 => {
+            pio & (PARK_PIO0 << ((addr >> 20) & 1)) != 0 && (write || !matches!(addr & 0xFFF, 0x004 | 0x00C))
+        }
+        0x4 if matches!(addr & !0x3FFF, 0x4003_4000 | 0x4003_8000) => {
+            pio & (PARK_UART0 << ((addr >> 14) & 3 == 2) as u8) != 0 && (write || addr & 0xFFF != 0x018)
+        }
+        0xD => {
+            let o = addr & 0xFFF;
+            (pio & PARK_SPINLOCK != 0 && matches!(o, 0x100..=0x17F))
+                || write && (o == 0x054 || (gpio && matches!(o, 0x010..=0x03C)))
+        }
+        _ => false,
+    }
 }
 
 /// True for reads the idle-loop detector may repeat: they have no side
@@ -138,6 +332,21 @@ fn idle_clean_read(addr: u32) -> bool {
         _ => false,
     }
 }
+
+/// Bit index of `addr`'s 1 KB page in [`Bus::code_pages`], for the three
+/// cacheable regions; keyed by the address as fetched, like the decode
+/// cache tags.
+#[inline(always)]
+fn code_page_index(addr: u32) -> Option<usize> {
+    let region = addr >> 28;
+    if region > 2 {
+        return None;
+    }
+    Some(((region as usize) << 16) | ((addr >> 10) & 0xFFFF) as usize)
+}
+
+/// SRAM pages in [`Bus::jit_pages`].
+pub(crate) const JIT_PAGES: usize = SRAM_SIZE / 1024;
 
 /// USB controller DPRAM, 4 KB, plain memory at every access width.
 pub const USBCTRL_DPRAM_BASE: u32 = 0x5010_0000;
@@ -408,6 +617,8 @@ pub struct Bus {
     pub(crate) usbctrl: picoem_common::usb::UsbCtrl,
     /// Idle-loop detector bookkeeping.
     pub(crate) idle: IdleTrack,
+    /// Parked polling passes, per core; see [`crate::IdleSkip`].
+    pub(crate) park: [ParkWatch; 2],
     /// I2C0 — DW_apb_i2c.
     pub(crate) i2c0: I2cRegs,
     /// I2C1 — DW_apb_i2c.
@@ -488,11 +699,11 @@ pub struct Bus {
     bus_fault_addr: u32,
     /// Per-quantum bank-touched bitmap — bit N = bank N was accessed by
     /// the core 0 step. Read by core 1 to compute +1 cycle contention.
-    core0_bank_touched: u8,
+    pub(crate) core0_bank_touched: u8,
     /// True while the currently-running core is core 1 and it is looking
     /// up contention against `core0_bank_touched`. Set/cleared by the
     /// dual-core scheduler via `begin_core1_step` / `end_core1_step`.
-    contention_check_active: bool,
+    pub(crate) contention_check_active: bool,
     /// MMIO trace toggle (see `wrk_docs/2026.04.15 - HLD - RP2040 Peripheral
     /// Coverage V7.md` §4.3). When `true`, each byte/half/word bus access
     /// and each peripheral/SIO/PPB dispatch emits a line to
@@ -519,6 +730,21 @@ pub struct Bus {
     /// just ran, evicting stale entries. Mirrors the rp2350_emu
     /// `Bus::pending_cache_invalidations` mechanism (commit 0c31479).
     pub pending_cache_invalidations: Vec<u32>,
+    /// One bit per 1 KB page of the cacheable regions, set once the decode
+    /// cache has held an instruction there; see [`code_page_index`].
+    /// Stores elsewhere cannot evict anything and queue no invalidation.
+    pub(crate) code_pages: Vec<u64>,
+    /// 1 KB SRAM pages holding a word some active park watches; the block
+    /// engine's SRAM fast path skips them. A superset is safe.
+    pub(crate) watch_pages: [u64; 5],
+    /// One byte per 1 KB SRAM page for compiled blocks: bit 0, loads take
+    /// the slow path; bit 1, stores do. Watched pages set both. A page
+    /// holding code sets bits 1 and 2 on itself and both neighbours, which
+    /// covers the near-edge rule of [`Self::jit_sram`]; bit 2 keeps the code
+    /// mark across watch refreshes.
+    pub(crate) jit_pages: [u8; JIT_PAGES],
+    /// [`Self::jit_timer`]'s last master cycle, clock and result.
+    jit_timer_cache: std::cell::Cell<(u64, u32, u64)>,
     /// Region-scoped bulk-invalidation bitmask. Set by
     /// [`Self::load_bootrom`] (bit [`invalidation_regions::ROM`]),
     /// [`Self::load_flash`] (bit [`invalidation_regions::XIP`]), and ISB
@@ -566,6 +792,7 @@ impl Bus {
             spi1: SpiRegs::new(IRQ_SPI1_IRQ),
             usbctrl: picoem_common::usb::UsbCtrl::new_rp2040(),
             idle: IdleTrack::default(),
+            park: [ParkWatch::default(), ParkWatch::default()],
             i2c0: I2cRegs::new(IRQ_I2C0_IRQ),
             i2c1: I2cRegs::new(IRQ_I2C1_IRQ),
             adc: AdcRegs::new(IRQ_ADC_IRQ_FIFO),
@@ -592,6 +819,10 @@ impl Bus {
             // 16 entries up front — STM tops out at 13 registers; 16
             // covers a worst-case STM PC-rewrite without reallocation.
             pending_cache_invalidations: Vec::with_capacity(16),
+            code_pages: vec![0; 3 * 65536 / 64],
+            watch_pages: [0; 5],
+            jit_pages: [0; JIT_PAGES],
+            jit_timer_cache: std::cell::Cell::new((u64::MAX, 0, 0)),
             pending_invalidation_regions: 0,
         }
     }
@@ -791,6 +1022,131 @@ impl Bus {
         self.pending_invalidation_regions |= invalidation_regions::ROM;
     }
 
+    /// Marks `pc`'s page as holding decoded code.
+    #[inline]
+    pub(crate) fn set_code_page(&mut self, pc: u32) {
+        if let Some(i) = code_page_index(pc) {
+            self.code_pages[i >> 6] |= 1 << (i & 63);
+        }
+        if pc >> 24 == 0x20 {
+            let p = ((pc & 0x00FF_FFFF) >> 10) as usize;
+            for q in p.saturating_sub(1)..(p + 2).min(JIT_PAGES) {
+                self.jit_pages[q] |= 6;
+            }
+        }
+    }
+
+    #[inline(always)]
+    fn is_code_page(&self, addr: u32) -> bool {
+        code_page_index(addr).is_some_and(|i| self.code_pages[i >> 6] & (1 << (i & 63)) != 0)
+    }
+
+    /// A code halfword read without bus side effects, from ROM, the XIP
+    /// flash window or SRAM; `None` elsewhere. Used by the block engine.
+    #[inline]
+    pub(crate) fn peek_code16(&self, pc: u32) -> Option<u16> {
+        match pc >> 24 {
+            0x00 if (pc as usize) + 1 < ROM_SIZE => Some(self.memory.rom_read16(pc)),
+            0x10..=0x13 => xip_flash_offset(pc).map(|o| self.memory.xip_read16(o)),
+            0x20 if ((pc & 0x00FF_FFFF) as usize) + 1 < SRAM_SIZE => Some(self.memory.sram_read16(pc & 0x00FF_FFFF)),
+            _ => None,
+        }
+    }
+
+    /// Rebuilds [`Self::watch_pages`] from the active parks.
+    pub(crate) fn refresh_watch_pages(&mut self) {
+        let mut pages = [0u64; 5];
+        for p in &self.park {
+            if p.active {
+                for &w in &p.words {
+                    let page = ((w & 0x00FF_FFFF) >> 10) as usize;
+                    if w >> 24 == 0x20 && page < 5 * 64 {
+                        pages[page >> 6] |= 1 << (page & 63);
+                    }
+                }
+            }
+        }
+        for w in 0..5 {
+            let mut changed = pages[w] ^ self.watch_pages[w];
+            while changed != 0 {
+                let p = 64 * w + changed.trailing_zeros() as usize;
+                changed &= changed - 1;
+                if p < JIT_PAGES {
+                    let b = &mut self.jit_pages[p];
+                    let code = *b & 4;
+                    *b = code | (code >> 1) | if pages[w] & (1 << (p & 63)) != 0 { 3 } else { 0 };
+                }
+            }
+        }
+        self.watch_pages = pages;
+    }
+
+    /// Whether compiled blocks may read TIMERAWL and TIMERAWH without the
+    /// bus, and the microsecond count those reads return: `master_cycle`
+    /// scaled as [`TimerRegs::read32`] does.
+    pub(crate) fn jit_timer(&self) -> (bool, u64) {
+        // The block engine asks once per run; the clock moves only at
+        // quantum ends, so the division is cached.
+        let (mc, hz, us) = self.jit_timer_cache.get();
+        let us = if mc == self.master_cycle && hz == self.clock_tree.sys_clk_hz {
+            us
+        } else {
+            let div = (self.clock_tree.sys_clk_hz / 1_000_000).max(1) as u64;
+            let us = self.master_cycle / div;
+            self.jit_timer_cache.set((self.master_cycle, self.clock_tree.sys_clk_hz, us));
+            us
+        };
+        (!peripheral_dispatch::is_held_in_reset(self, TIMER_BASE), us)
+    }
+
+    /// Whether the block engine may use its SRAM fast path for this block:
+    /// no idle tracking, no MMIO trace, no bank contention window.
+    #[inline(always)]
+    pub(crate) fn jit_fast(&self) -> bool {
+        !self.idle.on && !self.mmio_trace_enabled && !self.contention_check_active
+    }
+
+    /// Whether compiled blocks may use their SRAM fast path, calling the
+    /// idle-tracking hooks themselves while tracking is live: no MMIO
+    /// trace and no bank contention window.
+    #[inline(always)]
+    pub(crate) fn jit_pages_ok(&self) -> bool {
+        !self.mmio_trace_enabled && !self.contention_check_active
+    }
+
+    /// The SRAM offset of an access the block engine may make directly, or
+    /// `None` for the slow path: outside SRAM, on a watched page, or, for a
+    /// store, on or next to a page holding decoded code, as
+    /// [`Self::invalidate_pc_range`] tests. Records core 0's bank touch as
+    /// the bus does.
+    #[inline(always)]
+    pub(crate) fn jit_sram(&mut self, addr: u32, size: u32, write: bool) -> Option<u32> {
+        if addr >> 24 != 0x20 {
+            return None;
+        }
+        let off = addr & 0x00FF_FFFF;
+        if (off + size) as usize > SRAM_SIZE {
+            return None;
+        }
+        let page = (off >> 10) as usize;
+        if self.watch_pages[page >> 6] & (1 << (page & 63)) != 0 {
+            return None;
+        }
+        if write {
+            let near_edge = !(2..=0x3FC).contains(&(addr & 0x3FF));
+            if self.is_code_page(addr)
+                || near_edge && (self.is_code_page(addr.wrapping_sub(2)) || self.is_code_page(addr.wrapping_add(3)))
+            {
+                return None;
+            }
+        }
+        if self.active_core == 0 {
+            let bank = if off < 0x4_0000 { (off >> 2) & 3 } else if off < 0x4_1000 { 4 } else { 5 };
+            self.core0_bank_touched |= 1 << bank;
+        }
+        Some(off)
+    }
+
     /// Queue cache invalidations covering `[addr, addr+len)` on the
     /// per-core decode caches. `len` is 1, 2, or 4 bytes. Pushes into
     /// [`Self::pending_cache_invalidations`]; the driver
@@ -806,7 +1162,13 @@ impl Bus {
     #[inline]
     fn invalidate_pc_range(&mut self, addr: u32, len: u8) {
         debug_assert!(len == 1 || len == 2 || len == 4);
-        if matches!(addr >> 28, 0x0..=0x2) {
+        // The drain evicts slots at addr - 2 to addr + 2; those bytes touch
+        // a neighbouring page only within 3 bytes of a page edge.
+        let near_edge = !(2..=0x3FC).contains(&(addr & 0x3FF));
+        if matches!(addr >> 28, 0x0..=0x2)
+            && (self.is_code_page(addr)
+                || near_edge && (self.is_code_page(addr.wrapping_sub(2)) || self.is_code_page(addr.wrapping_add(3))))
+        {
             self.pending_cache_invalidations.push(addr);
             if len == 4 {
                 self.pending_cache_invalidations.push(addr.wrapping_add(2));
@@ -830,8 +1192,88 @@ impl Bus {
     /// Idle-loop detector: note a core data read.
     #[inline(always)]
     fn idle_read(&mut self, addr: u32) {
-        if self.idle.on && !idle_clean_read(addr) {
+        self.idle_classify_read(addr);
+        if self.park[0].active | self.park[1].active {
+            self.park_check(addr, false);
+        }
+        if self.idle.logging & self.idle.watch & !self.idle.on {
+            self.snap_check(addr, false);
+        }
+    }
+
+    /// The idle-loop detector's part of [`Self::idle_read`], without the
+    /// park check. Compiled blocks call it for their fast SRAM accesses and
+    /// TIMER reads, which no park check can hit: a page holding a parked
+    /// core's word is never on the fast path.
+    #[inline(always)]
+    pub(crate) fn idle_classify_read(&mut self, addr: u32) {
+        if self.idle.on {
+            if self.idle.watch {
+                self.idle_watch_read(addr);
+            } else if !idle_clean_read(addr) {
+                self.idle.dirty = true;
+            }
+        }
+    }
+
+    /// Watch-mode read: constant within the quantum, or recorded so the
+    /// other core's accesses can be checked against it.
+    #[inline(never)]
+    fn idle_watch_read(&mut self, addr: u32) {
+        match addr >> 28 {
+            0x0 => {}
+            0x1 if matches!(addr >> 24, 0x10..=0x13) => {}
+            0x2 => {
+                if !self.idle.note_word(addr & !3) {
+                    self.idle.dirty = true;
+                }
+            }
+            0x4 if matches!(addr & !0x3000, a if a == TIMER_BASE + 0x24 || a == TIMER_BASE + 0x28) => self.idle.timer = true,
+            0x5 if matches!(addr & 0xFFF0_0FFF, 0x5020_0004 | 0x5020_000C | 0x5030_0004 | 0x5030_000C) => {
+                self.idle.pio |= PARK_PIO0 << ((addr >> 20) & 1);
+            }
+            0x4 if matches!(addr & !0x3000, 0x4003_4018 | 0x4003_8018) => {
+                self.idle.pio |= PARK_UART0 << ((addr >> 14) & 3 == 2) as u8;
+            }
+            0xD if matches!(addr & 0xFFF, 0x000) => {}
+            0xD if matches!(addr & 0xFFF, 0x100..=0x17F) => self.idle.pio |= PARK_SPINLOCK,
+            0xD if matches!(addr & 0xFFF, 0x004 | 0x008) => self.idle.gpio = true,
+            _ => {
+                self.idle.dirty = true;
+                if self.idle.debug_dirty && self.idle.dirty_log.len() < 1 << 20 {
+                    self.idle.dirty_log.push((addr, false));
+                }
+            }
+        }
+    }
+
+    /// An access by the running core that could change what a parked core
+    /// reads, as [`watch_conflict`] decides.
+    #[inline(never)]
+    fn park_check(&mut self, addr: u32, write: bool) {
+        let me = self.active_core();
+        let p = &mut self.park[1 - me];
+        if !p.active || p.hit {
+            return;
+        }
+        if watch_conflict(addr, write, p.pio, p.gpio, |w| (write || p.stored) && p.words.contains(&w)) {
+            p.hit = true;
+        }
+    }
+
+    /// The same check for the pass the other core is tracking in watch
+    /// mode: an access that could change what it has read so far makes
+    /// the pass dirty, as an interruption, so it neither parks on values
+    /// it no longer sees nor marks its head busy.
+    #[inline(never)]
+    fn snap_check(&mut self, addr: u32, write: bool) {
+        let t = &self.idle;
+        if t.dirty {
+            return;
+        }
+        if watch_conflict(addr, write, t.pio, t.gpio, |w| (write || t.stored) && t.has_word(w)) {
             self.idle.dirty = true;
+            self.idle.event = true;
         }
     }
 
@@ -841,8 +1283,45 @@ impl Bus {
     /// effect.
     #[inline(always)]
     fn idle_write(&mut self, addr: u32, size: u32) {
+        if self.park[0].active | self.park[1].active {
+            self.park_check(addr, true);
+        }
+        if self.idle.logging & self.idle.watch & !self.idle.on {
+            self.snap_check(addr, true);
+        }
+        self.idle_classify_write(addr, size);
+    }
+
+    /// The idle-loop detector's part of [`Self::idle_write`], without the
+    /// park check, as [`Self::idle_classify_read`].
+    #[inline(always)]
+    pub(crate) fn idle_classify_write(&mut self, addr: u32, size: u32) {
         if !self.idle.on {
             return;
+        }
+        if self.idle.watch {
+            if addr >> 28 == 0xD && matches!(addr & 0xFFF, 0x100..=0x17F) {
+                self.idle.pio |= PARK_SPINLOCK;
+                return;
+            }
+            if addr >> 28 == 0x2 && !self.idle.logging {
+                return;
+            }
+            let ok = addr >> 28 == 0x2 && {
+                let first = addr & !3;
+                let last = (addr + size - 1) & !3;
+                let a = self.idle.note_word(first);
+                let b = self.idle.note_word(last);
+                a && b
+            };
+            if !ok {
+                self.idle.dirty = true;
+                if self.idle.debug_dirty && self.idle.dirty_log.len() < 1 << 20 {
+                    self.idle.dirty_log.push((addr, true));
+                }
+                return;
+            }
+            self.idle.stored = true;
         }
         match addr >> 28 {
             0x2 => {
@@ -850,14 +1329,11 @@ impl Bus {
                 if !self.idle.logging {
                     return;
                 }
-                if (off + size) as usize <= SRAM_SIZE && self.idle.log.len() < IDLE_LOG_MAX {
-                    let old = match size {
-                        1 => self.memory.sram_read8(off) as u32,
-                        2 => self.memory.sram_read16(off) as u32,
-                        _ => self.memory.sram_read32(off),
-                    };
-                    self.idle.log.push((off, size, old));
-                } else {
+                // A store stays within its aligned word, so the whole word
+                // is logged once, before the first store to it.
+                let w = off & !3;
+                let mem = &self.memory;
+                if (off + size) as usize > SRAM_SIZE || !self.idle.log_word(w, || mem.sram_read32(w)) {
                     self.idle.dirty = true;
                 }
             }
@@ -866,20 +1342,89 @@ impl Bus {
         }
     }
 
-    /// Idle-loop detector: every byte stored since the snapshot holds its
-    /// snapshot value again, the first logged old value of each byte.
-    pub(crate) fn idle_memory_restored(&mut self) -> bool {
-        let bytes = &mut self.idle.bytes;
-        bytes.clear();
-        for &(off, size, old) in &self.idle.log {
-            for i in 0..size {
-                bytes.push((off + i, (old >> (8 * i)) as u8));
+    /// Everything a parked pass of `core` read that can change between
+    /// quanta without a core access: its SRAM words, which DMA may write,
+    /// the polled PIO and UART status, GPIO_IN, and the core's side state.
+    pub(crate) fn park_fingerprint(&self, core: usize) -> Vec<u32> {
+        let mut v = Vec::new();
+        self.inputs_visit(true, core, |x| {
+            v.push(x);
+            true
+        });
+        v
+    }
+
+    /// Whether [`Self::park_fingerprint`] still equals the one taken at
+    /// park time.
+    pub(crate) fn park_inputs_held(&self, core: usize) -> bool {
+        let vals = &self.park[core].vals;
+        let mut i = 0;
+        let held = self.inputs_visit(true, core, |x| {
+            let ok = vals.get(i) == Some(&x);
+            i += 1;
+            ok
+        });
+        held && i == vals.len()
+    }
+
+    /// [`Self::park_fingerprint`] for the pass `core` is tracking now: what
+    /// it has read since its snapshot.
+    pub(crate) fn idle_fingerprint(&self, core: usize, out: &mut Vec<u32>) {
+        out.clear();
+        self.inputs_visit(false, core, |x| {
+            out.push(x);
+            true
+        });
+    }
+
+    /// Feeds the inputs of `core`'s park when `park`, else of the tracked
+    /// pass, to `f` in a fixed order; stops and returns false as soon as
+    /// `f` does.
+    fn inputs_visit(&self, park: bool, core: usize, mut f: impl FnMut(u32) -> bool) -> bool {
+        let (words, blocks, gpio) = if park {
+            let p = &self.park[core];
+            (&p.words[..], p.pio, p.gpio)
+        } else {
+            (&self.idle.words[..], self.idle.pio, self.idle.gpio)
+        };
+        for &w in words {
+            let off = w & 0x00FF_FFFF;
+            if !f(if (off as usize) + 4 <= SRAM_SIZE { self.memory.sram_read32(off) } else { 0 }) {
+                return false;
             }
         }
-        // A stable sort keeps each byte's first logged value first.
-        bytes.sort_by_key(|b| b.0);
-        bytes.dedup_by_key(|b| b.0);
-        bytes.iter().all(|&(a, v)| self.memory.sram_read8(a) == v)
+        for b in 0..2 {
+            if blocks & (PARK_PIO0 << b) != 0 && !(f(self.pio[b].fstat()) && f(self.pio[b].flevel())) {
+                return false;
+            }
+        }
+        if blocks & PARK_UART0 != 0 && !f(self.uart0.fr_read()) {
+            return false;
+        }
+        if blocks & (PARK_UART0 << 1) != 0 && !f(self.uart1.fr_read()) {
+            return false;
+        }
+        if gpio && !f(self.gpio_in) {
+            return false;
+        }
+        self.idle_watch_side(core, blocks).into_iter().all(f)
+    }
+
+    /// [`Self::idle_side_state`] as a watch-mode pass with inputs `blocks`
+    /// depends on it: the spinlock claim bits only when it used a spinlock,
+    /// since the running core takes and frees its own.
+    pub(crate) fn idle_watch_side(&self, core: usize, blocks: u8) -> [u32; 9] {
+        let mut side = self.idle_side_state(core);
+        if blocks & PARK_SPINLOCK == 0 {
+            side[0] = 0;
+        }
+        side
+    }
+
+    /// Idle-loop detector: every word stored since the snapshot holds the
+    /// value it had before the first store to it.
+    pub(crate) fn idle_memory_restored(&self) -> bool {
+        self.idle.log.iter().all(|&(off, old)| self.memory.sram_read32(off) == old)
     }
 
     /// State outside the core and SRAM that a clean pass may touch and the
@@ -2192,6 +2737,12 @@ impl Bus {
     /// produce DREQ), then `tick_dma` consumes the snapshot. Call at the
     /// tail of [`Self::tick_peripherals`].
     pub fn tick_dma(&mut self) {
+        // With no channel busy a tick moves nothing: only the IRQ lines
+        // need routing, and the DREQs need not be collected.
+        if !self.dma.any_busy() {
+            self.dma.route_irqs(&mut self.irq_pending);
+            return;
+        }
         let mut dma = std::mem::take(&mut self.dma);
         dma.tick(self);
         dma.route_irqs(&mut self.irq_pending);
@@ -2314,6 +2865,13 @@ impl Default for Bus {
 use crate::core::CoreBus;
 
 impl CoreBus for Bus {
+    #[inline]
+    fn fetch16(&mut self, addr: u32) -> u16 {
+        let touched = self.core0_bank_touched;
+        let v = Bus::read16(self, addr);
+        self.core0_bank_touched = touched;
+        v
+    }
     #[inline(always)]
     fn read8(&mut self, addr: u32) -> u8 {
         self.idle_read(addr);
@@ -2347,6 +2905,17 @@ impl CoreBus for Bus {
     #[inline(always)]
     fn idle_mark_dirty(&mut self) {
         self.idle.dirty = true;
+        self.idle.event = true;
+    }
+    #[inline(always)]
+    fn idle_mark_exception(&mut self) {
+        self.idle.dirty = true;
+        self.idle.event = true;
+        self.idle.exception = true;
+    }
+    #[inline]
+    fn mark_code_page(&mut self, pc: u32) {
+        self.set_code_page(pc);
     }
     fn set_active_pc(&mut self, pc: u32) {
         Bus::set_active_pc(self, pc)

@@ -415,6 +415,10 @@ pub struct CortexM33 {
     pub(crate) peer_reservation: Option<u32>,
     /// Set by the write wrappers when a write hit `peer_reservation`.
     pub(crate) peer_reservation_hit: bool,
+    /// Address of this core's previous fetch, for the sequential-fetch check in `decode_execute`.
+    /// Per core, because the other core's fetches in between are not part of this core's prefetch
+    /// stream, and how the two interleave depends on the quantum.
+    pub(crate) last_fetch_addr: u32,
     /// Per-core SIO state — DIV and INTERP register files. Phase 3
     /// Stage 3 (LLD V7 §6): moved off `Sio` because each core sees
     /// its own divider and interpolator state. DIV/INTERP MMIO
@@ -512,6 +516,7 @@ impl CortexM33 {
             did_write_this_quantum: false,
             peer_reservation: None,
             peer_reservation_hit: false,
+            last_fetch_addr: u32::MAX,
             sio_local: PerCoreSio::default(),
             decode_cache,
             counters: CoreCounters::default(),

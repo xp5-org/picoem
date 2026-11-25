@@ -38,6 +38,7 @@
 
 use crate::bus::Bus;
 use crate::dreq::{DREQ_FORCE, DREQ_TIMER0, DREQ_TIMER3};
+
 use crate::irq::{IRQ_DMA_IRQ_0, IRQ_DMA_IRQ_1, IRQ_DMA_IRQ_2, IRQ_DMA_IRQ_3};
 
 /// Total number of DMA channels on RP2350 (datasheet §12.6.1).

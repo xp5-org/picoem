@@ -317,7 +317,7 @@ impl CortexM33 {
         // The M33 prefetch buffer absorbs bank 2/6 penalty on sequential
         // fetches. Read BEFORE the cache lookup (which may call
         // populate_decode_cache).
-        let last = bus.last_fetch_addr();
+        let last = self.last_fetch_addr;
         let is_sequential = pc == last.wrapping_add(2) || pc == last.wrapping_add(4);
 
         // Cache lookup — by-value (`DecodedOp: Copy`), so no borrow on
@@ -346,7 +346,7 @@ impl CortexM33 {
         // check. For wide instructions the second halfword is at pc+2,
         // so the next sequential PC is pc+4 (checked via wrapping_add(2)
         // on the stored value pc+2).
-        bus.set_last_fetch_addr(if is_wide { pc.wrapping_add(2) } else { pc });
+        self.last_fetch_addr = if is_wide { pc.wrapping_add(2) } else { pc };
 
         // IT block state — identical to pre-cache behaviour.
         let in_it = self.it_state & 0xF != 0;

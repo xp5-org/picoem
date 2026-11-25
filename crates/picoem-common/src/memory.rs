@@ -90,6 +90,16 @@ impl Memory {
 
     // --- SRAM ---
 
+    /// Base of SRAM, for code that reads and writes it directly. The buffer
+    /// never moves after construction.
+    pub fn sram_ptr(&mut self) -> *mut u8 {
+        self.sram.as_mut_ptr()
+    }
+
+    pub fn sram_len(&self) -> usize {
+        self.sram.len()
+    }
+
     pub fn sram_read8(&self, offset: u32) -> u8 {
         self.sram.get(offset as usize).copied().unwrap_or(0)
     }

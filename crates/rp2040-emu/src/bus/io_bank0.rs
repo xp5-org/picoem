@@ -88,7 +88,10 @@ impl IoBank0 {
 
     /// IO_IRQ_BANK0 level: either processor has an enabled interrupt.
     pub(crate) fn irq_active(&self) -> bool {
-        (0..4).any(|b| self.ints(0, b) != 0 || self.ints(1, b) != 0)
+        // INTS is masked by INTE, so with nothing enabled no pin can raise
+        // it, whatever INTR holds.
+        let enabled = (0..4).fold(0, |a, b| a | self.proc0_inte[b] | self.proc1_inte[b]);
+        enabled != 0 && (0..4).any(|b| self.ints(0, b) != 0 || self.ints(1, b) != 0)
     }
 
     pub fn new() -> Self {

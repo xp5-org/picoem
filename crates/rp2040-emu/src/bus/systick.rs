@@ -116,6 +116,26 @@ impl SysTick {
         self.cvr -= 1;
         false
     }
+
+    /// `n` calls of [`Self::tick`] at once. Returns `true` iff any of them
+    /// would have.
+    pub fn tick_n(&mut self, n: u64) -> bool {
+        if n == 0 || !self.is_enabled() {
+            return false;
+        }
+        let cvr = self.cvr as u64;
+        if n <= cvr {
+            self.cvr -= n as u32;
+            return false;
+        }
+        // `cvr` decrements, then a reload; each later period is `rvr + 1`
+        // ticks and ends with a reload back to `rvr`.
+        let rvr = self.rvr & 0x00FF_FFFF;
+        let rest = (n - cvr - 1) % (rvr as u64 + 1);
+        self.cvr = rvr - rest as u32;
+        self.csr |= 1 << 16;
+        self.csr & 2 != 0
+    }
 }
 
 #[cfg(test)]
@@ -128,6 +148,34 @@ mod tests {
         s.write32(0xE000_E014, rvr); // RVR
         s.write32(0xE000_E018, 0xDEAD_BEEF); // CVR (any write zeroes)
         s.write32(0xE000_E010, 0b111); // CSR: ENABLE | TICKINT | CLKSOURCE
+    }
+
+    /// `tick_n` leaves the state `n` single ticks leave and fires iff one
+    /// of them fires.
+    #[test]
+    fn tick_n_matches_single_ticks() {
+        for rvr in [0u32, 1, 2, 7, 100] {
+            for cvr0 in [0u32, 1, 5, 100] {
+                for csr in [0b101u32, 0b111, 0b110] {
+                    for n in [0u64, 1, 2, 3, 6, 7, 8, 9, 101, 102, 250, 1000] {
+                        let mut a = SysTick::new();
+                        a.rvr = rvr;
+                        a.cvr = cvr0;
+                        a.csr = csr;
+                        let mut b = SysTick::new();
+                        b.rvr = a.rvr;
+                        b.cvr = a.cvr;
+                        b.csr = a.csr;
+                        let mut fired = false;
+                        for _ in 0..n {
+                            fired |= a.tick();
+                        }
+                        assert_eq!(b.tick_n(n), fired, "rvr {rvr} cvr {cvr0} csr {csr:b} n {n}");
+                        assert_eq!((a.cvr, a.csr), (b.cvr, b.csr), "rvr {rvr} cvr {cvr0} csr {csr:b} n {n}");
+                    }
+                }
+            }
+        }
     }
 
     #[test]

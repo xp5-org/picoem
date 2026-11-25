@@ -208,7 +208,7 @@ impl CortexM0Plus {
     #[cold]
     #[inline(never)]
     fn populate_decode_cache<B: CoreBus>(&mut self, bus: &mut B, pc: u32) -> DecodedOp {
-        let hw0 = bus.read16(pc);
+        let hw0 = bus.fetch16(pc);
         if bus.bus_fault() {
             // Fetch fault — return a non-cacheable sentinel entry so
             // the caller can dispatch and the post-step fault delivery
@@ -223,7 +223,7 @@ impl CortexM0Plus {
 
         let wide = is_wide(hw0);
         let hw1 = if wide {
-            bus.read16(pc.wrapping_add(2))
+            bus.fetch16(pc.wrapping_add(2))
         } else {
             0
         };
@@ -251,6 +251,10 @@ impl CortexM0Plus {
         if is_cacheable_pc(pc) {
             let slot = ((pc >> 1) & CACHE_INDEX_MASK) as usize;
             self.decode_cache[slot] = entry;
+            bus.mark_code_page(pc);
+            if wide {
+                bus.mark_code_page(pc.wrapping_add(2));
+            }
         }
 
         entry

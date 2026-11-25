@@ -76,6 +76,10 @@ pub struct PioBlock {
     /// above. Seeded on construction/reset so the first step's
     /// comparison is against the reset value (0).
     pub(crate) prev_pad_out_diag: u32,
+    /// When `Some`, [`Self::step_n_with_pins`] appends `(cycles done, pad_out, pad_oe)` for every
+    /// cycle after which the merged pad state differs from the one before it. The caller owns it:
+    /// set it to `Some(Vec::new())` before the call and take it after.
+    pub pad_log: Option<Vec<(u32, u32, u32)>>,
 }
 
 impl Default for PioBlock {
@@ -117,6 +121,7 @@ impl PioBlock {
             pad_out_sck_toggles: 0,
             pad_out_mosi_writes_of_1: 0,
             prev_pad_out_diag: 0,
+            pad_log: None,
         }
     }
 
@@ -205,22 +210,23 @@ impl PioBlock {
     }
 
     /// Compute the 12-bit raw interrupt status (INTR register) using the
-    /// RP2040 bit layout (RP2040 datasheet Table 358, INTR at offset 0x128):
-    ///   bits  [3:0] = SM3..SM0 IRQ flags (from `irq_flags[3:0]`)
-    ///   bits  [7:4] = SM3..SM0 RXNEMPTY (RX not empty → 1)
-    ///   bits [11:8] = SM3..SM0 TXNFULL  (TX not full → 1)
+    /// RP2040 bit layout (RP2040 datasheet, INTR at offset 0x128, and the
+    /// pico-sdk `pio_interrupt_source` values):
+    ///   bits  [3:0] = SM3..SM0 RXNEMPTY (RX not empty → 1)
+    ///   bits  [7:4] = SM3..SM0 TXNFULL  (TX not full → 1)
+    ///   bits [11:8] = SM3..SM0 IRQ flags (from `irq_flags[3:0]`)
     ///
     /// Only the low 4 IRQ flags are routable on RP2040; flags 4..7 are
     /// intra-PIO only and do not appear in INTR. Bits [31:12] are zero.
     #[inline]
     pub fn raw_intr_rp2040(&self) -> u32 {
-        let mut v: u32 = (self.irq_flags as u32) & 0xF; // IRQ[3:0] → bits [3:0]
+        let mut v: u32 = ((self.irq_flags as u32) & 0xF) << 8; // IRQ[3:0] → bits [11:8]
         for i in 0..4u32 {
             if !self.sm[i as usize].rx_fifo.is_empty() {
-                v |= 1 << (4 + i); // RXNEMPTY → bits [7:4]
+                v |= 1 << i; // RXNEMPTY → bits [3:0]
             }
             if !self.sm[i as usize].tx_fifo.is_full() {
-                v |= 1 << (8 + i); // TXNFULL  → bits [11:8]
+                v |= 1 << (4 + i); // TXNFULL  → bits [7:4]
             }
         }
         v
@@ -385,8 +391,8 @@ impl PioBlock {
     /// Advance PIO block by `n` system clocks. Quantum-end variant of
     /// [`Self::step`]. Initial implementation is a naive loop — preserves all
     /// cross-cycle state (SM clock divider accumulators, FIFO pressure,
-    /// pin-output merging). A bulk-advance optimisation is future work if
-    /// PIO appears hot in a flamegraph.
+    /// pin-output merging), with the bulk and skip paths described in
+    /// [`Self::step_n_with_pins`].
     pub fn step_n(&mut self, n: u32, gpio_in: u32) {
         self.step_n_with_pins(n, gpio_in as u64);
     }
@@ -405,19 +411,84 @@ impl PioBlock {
         // and stall counters advanced. Re-checked after every stepped cycle, so
         // a short burst of activity inside a long quantum only pays for the
         // cycles it is active.
+        //
+        // When some SM is not quiescent, the cycles before its next PIO clock
+        // are skipped the same way: no SM executes in them, so no IRQ flag,
+        // FIFO or pin changes; quiescent SMs take them as stall cycles and
+        // the others only move their divider accumulators. The cycle the
+        // first non-quiescent SM clocks on then runs through the per-cycle
+        // path, in SM order as always. A free-running output SM such as I2S
+        // then costs O(its PIO clocks) instead of O(system clocks).
         let mut left = n;
+        let mut last_pads = (self.pad_out, self.pad_oe);
         while left > 0 {
             #[cfg(not(feature = "pio-pad-diag"))]
-            if left > 1 && self.all_quiescent(gpio_pins) {
-                for sm in self.sm.iter_mut() {
-                    let ok = sm.bulk_stall(left);
-                    debug_assert!(ok);
+            if left > 1 {
+                if self.all_quiescent(gpio_pins) {
+                    for sm in self.sm.iter_mut() {
+                        let ok = sm.bulk_stall(left);
+                        debug_assert!(ok);
+                    }
+                    self.merge_pin_outputs();
+                    return;
                 }
-                self.merge_pin_outputs();
-                return;
+                let skip = self.cycles_to_next_active_tick(gpio_pins).saturating_sub(1).min(left - 1);
+                if skip > 0 {
+                    self.skip_idle_cycles(skip, gpio_pins);
+                    left -= skip;
+                }
             }
             self.step_with_pins(gpio_pins);
             left -= 1;
+            if self.pad_log.is_some() && (self.pad_out, self.pad_oe) != last_pads {
+                last_pads = (self.pad_out, self.pad_oe);
+                let done = n - left;
+                if let Some(log) = self.pad_log.as_mut() {
+                    log.push((done, last_pads.0, last_pads.1));
+                }
+            }
+        }
+    }
+
+    /// System clocks until the first non-quiescent enabled SM gets a PIO
+    /// clock, counting the clock it happens on: 1 means the next one.
+    /// `u32::MAX` when every enabled SM is quiescent.
+    fn cycles_to_next_active_tick(&self, gpio_pins: u64) -> u32 {
+        let gpio_in = self.local_gpio_window(gpio_pins);
+        let flags = self.irq_flags;
+        let mut best = u32::MAX;
+        for sm in self.sm.iter() {
+            if !sm.enabled {
+                continue;
+            }
+            let t = sm.clkdiv_threshold();
+            if sm.clkdiv_acc < t && sm.quiescent(flags, gpio_in) {
+                continue;
+            }
+            let k = if sm.clkdiv_acc >= t { 1 } else { (t - sm.clkdiv_acc).div_ceil(256) };
+            best = best.min(k.max(1));
+        }
+        best
+    }
+
+    /// Advances every SM by `n` system clocks in which no SM gets to
+    /// execute: quiescent SMs count their PIO clocks as stall cycles, the
+    /// others only add to their divider accumulators. The caller makes sure
+    /// no non-quiescent SM reaches its threshold within `n`.
+    fn skip_idle_cycles(&mut self, n: u32, gpio_pins: u64) {
+        let gpio_in = self.local_gpio_window(gpio_pins);
+        let flags = self.irq_flags;
+        for sm in self.sm.iter_mut() {
+            if !sm.enabled {
+                continue;
+            }
+            if sm.clkdiv_acc < sm.clkdiv_threshold() && sm.quiescent(flags, gpio_in) {
+                let ok = sm.bulk_stall(n);
+                debug_assert!(ok);
+            } else {
+                sm.clkdiv_acc += 256 * n;
+                debug_assert!(sm.clkdiv_acc < sm.clkdiv_threshold());
+            }
         }
     }
 
@@ -537,7 +608,8 @@ impl PioBlock {
     }
 
     /// Compute FSTAT register from current SM FIFO states.
-    fn fstat(&self) -> u32 {
+    /// FSTAT, read without side effects.
+    pub fn fstat(&self) -> u32 {
         let mut val = 0u32;
         for i in 0..4 {
             if self.sm[i].tx_fifo.is_empty() {
@@ -557,7 +629,8 @@ impl PioBlock {
     }
 
     /// Compute FLEVEL register from current SM FIFO levels.
-    fn flevel(&self) -> u32 {
+    /// FLEVEL, read without side effects.
+    pub fn flevel(&self) -> u32 {
         let mut val = 0u32;
         for i in 0..4 {
             let tx = self.sm[i].tx_fifo.level() as u32;
@@ -1490,9 +1563,9 @@ mod tests {
         );
     }
 
-    /// RP2040 INTR bit layout: IRQ flags at [3:0], RXNEMPTY at [7:4],
-    /// TXNFULL at [11:8] — 12-bit register (RP2040 ds Table 358).
-    /// IRQ flag 0 → bit 0. Asserts that `raw_intr_rp2040` returns 0x001.
+    /// RP2040 INTR bit layout: RXNEMPTY at [3:0], TXNFULL at [7:4],
+    /// IRQ flags at [11:8] — 12-bit register.
+    /// IRQ flag 0 → bit 8. Asserts that `raw_intr_rp2040` returns 0x100.
     #[test]
     fn raw_intr_rp2040_layout() {
         let mut pio = PioBlock::new();
@@ -1500,9 +1573,9 @@ mod tests {
         assert_eq!(pio.irq_flags, 0x01, "irq_flags bit 0 must be set");
         let intr = pio.raw_intr_rp2040();
         assert_eq!(
-            intr & 0x001,
-            0x001,
-            "raw_intr_rp2040: IRQ flag 0 must appear at bit 0 (RP2040 ds Table 358)"
+            intr & 0x100,
+            0x100,
+            "raw_intr_rp2040: IRQ flag 0 must appear at bit 8"
         );
         assert_eq!(
             intr >> 12,
@@ -1945,6 +2018,52 @@ mod tests {
         assert_eq!((slow.sm[0].x, slow.sm[0].osr), (5, 7));
         assert_eq!(bulk.sm[0].clkdiv_acc, slow.sm[0].clkdiv_acc);
         assert_eq!(bulk.sm[0].stall_cycles(), slow.sm[0].stall_cycles());
+    }
+
+    /// An I2S-like free-running SM next to a quiescent one: SM0 shifts bits
+    /// out with autopull at a fractional divider while SM1 waits on a GPIO at
+    /// divider 1. The idle-cycle skip in `step_n_with_pins` must leave both in
+    /// exactly the per-cycle state, through running dry, stalling on autopull
+    /// and being refilled between calls.
+    #[test]
+    fn idle_skip_matches_per_cycle_with_free_running_sm() {
+        // 0: OUT PINS, 1   1: JMP 0   2: WAIT 1 GPIO 5
+        let prog = [0x6001, 0x0000, 0x2085];
+        let mk = || {
+            let mut p = make_pio_with_program(&prog);
+            p.sm[0].clkdiv_int = 3;
+            p.sm[0].clkdiv_frac = 0xB3;
+            p.sm[0].shiftctrl |= 1 << 17; // AUTOPULL, threshold 32
+            p.sm[0].pinctrl = (1 << 20) | 4; // OUT_COUNT 1, OUT_BASE 4
+            p.sm[1].pc = 2;
+            p.set_sm_enabled(1, true);
+            p.sm[1].clkdiv_int = 1;
+            p.sm[1].clkdiv_frac = 0;
+            for w in [0xA5A5_0F0Fu32, 0x1234_5678, 0xFFFF_0000] {
+                p.sm[0].tx_fifo.push(w);
+            }
+            p
+        };
+        let (mut fast, mut slow) = (mk(), mk());
+        for round in 0..40 {
+            if round % 9 == 8 {
+                fast.sm[0].tx_fifo.push(0xDEAD_BEEF ^ round);
+                slow.sm[0].tx_fifo.push(0xDEAD_BEEF ^ round);
+            }
+            let n = 37 + 61 * (round % 5);
+            fast.step_n_with_pins(n, 0);
+            step_n(&mut slow, n as usize, 0);
+            for i in 0..2 {
+                let (f, s) = (&fast.sm[i], &slow.sm[i]);
+                assert_eq!(
+                    (f.pc, f.x, f.osr, f.osr_count, f.clkdiv_acc, f.stalled, f.stall_cycles(), f.tx_fifo.level()),
+                    (s.pc, s.x, s.osr, s.osr_count, s.clkdiv_acc, s.stalled, s.stall_cycles(), s.tx_fifo.level()),
+                    "round {round} sm {i}"
+                );
+            }
+            assert_eq!((fast.pad_out, fast.pad_oe), (slow.pad_out, slow.pad_oe), "round {round}");
+        }
+        assert!(fast.sm[1].stalled, "SM1 kept waiting");
     }
 
     /// A burst of activity inside one long `step_n` call, running the loop
@@ -2590,12 +2709,12 @@ mod tests {
             assert!(pio.sm[2].tx_fifo.push(0));
         }
         let intr40 = pio.raw_intr_rp2040();
-        // RXNEMPTY at bits [7:4].
-        assert_ne!(intr40 & (1 << 4), 0, "SM0 RXNEMPTY");
-        assert_eq!(intr40 & (1 << 5), 0, "SM1 RX still empty");
-        // TXNFULL at bits [11:8].
-        assert_eq!(intr40 & (1 << 10), 0, "SM2 TX full → TXNFULL=0");
-        assert_ne!(intr40 & (1 << 11), 0, "SM3 TX has room → TXNFULL=1");
+        // RXNEMPTY at bits [3:0].
+        assert_ne!(intr40 & (1 << 0), 0, "SM0 RXNEMPTY");
+        assert_eq!(intr40 & (1 << 1), 0, "SM1 RX still empty");
+        // TXNFULL at bits [7:4].
+        assert_eq!(intr40 & (1 << 6), 0, "SM2 TX full → TXNFULL=0");
+        assert_ne!(intr40 & (1 << 7), 0, "SM3 TX has room → TXNFULL=1");
 
         let intr35 = pio.raw_intr_rp2350();
         // RP2350: RXNEMPTY at [3:0], TXNFULL at [7:4].
@@ -3233,12 +3352,12 @@ mod tests {
     #[test]
     fn int_ints_rp2040_layout_computes_from_inte_intf() {
         let mut pio = PioBlock::new();
-        // IRQ flag 0 set → RP2040 INTR bit 0.
+        // IRQ flag 0 set → RP2040 INTR bit 8.
         pio.write32(0x034, 0x01, 0); // IRQ_FORCE
-        pio.int0_inte = 0x001;
-        pio.int0_intf = 0x002;
+        pio.int0_inte = 0x100;
+        pio.int0_intf = 0x200;
         let v0 = pio.int0_ints_rp2040();
-        assert_eq!(v0 & 0x003, 0x003, "bit 0 via INTE, bit 1 via INTF");
+        assert_eq!(v0 & 0x300, 0x300, "bit 8 via INTE, bit 9 via INTF");
         pio.int1_inte = 0x004;
         pio.int1_intf = 0x008;
         let v1 = pio.int1_ints_rp2040();
@@ -3315,18 +3434,18 @@ mod tests {
         assert_eq!(ints0 & (1 << 8), 0, "flag 0 hidden once INTE bit 8 cleared");
         assert_ne!(ints0 & (1 << 9), 0, "INTF survives INTE clearing");
 
-        // RP2040 layout: flag 0 surfaces at bit 0 of INTR; verify via
+        // RP2040 layout: flag 0 surfaces at bit 8 of INTR; verify via
         // int0_ints_rp2040 / int1_ints_rp2040 helpers paired with INTE
         // and INTF.
-        pio.int0_inte = 0x001;
+        pio.int0_inte = 0x100;
         pio.int0_intf = 0x010;
-        pio.int1_inte = 0x002;
+        pio.int1_inte = 0x200;
         pio.int1_intf = 0;
         let l0 = pio.int0_ints_rp2040();
         let l1 = pio.int1_ints_rp2040();
-        assert_ne!(l0 & 0x001, 0, "RP2040 line 0: flag 0 enabled by INTE");
+        assert_ne!(l0 & 0x100, 0, "RP2040 line 0: flag 0 enabled by INTE");
         assert_ne!(l0 & 0x010, 0, "RP2040 line 0: INTF bit 4 forces");
-        assert_eq!(l1 & 0x001, 0, "RP2040 line 1: flag 0 not enabled");
+        assert_eq!(l1 & 0x100, 0, "RP2040 line 1: flag 0 not enabled");
     }
 
     /// CLKDIV fractional boundary at frac=255 (just under int+1). Verifies

@@ -351,7 +351,16 @@ impl PwmRegs {
             let old_ctr = slice.ctr as u64;
             // New counter position after `cycles` advances, modulo one
             // period. With TOP=0 the period is 1 and every cycle wraps.
-            let new_ctr = (old_ctr + cycles as u64) % period;
+            // A quantum is usually shorter than a period, so the division
+            // is the rare case.
+            let sum = old_ctr + cycles as u64;
+            let new_ctr = if sum < period {
+                sum
+            } else if sum < 2 * period {
+                sum - period
+            } else {
+                sum % period
+            };
             // The first wrap happens at offset `top + 1 - old_ctr`
             // sys_clks from now. Any `cycles >= that offset` triggers
             // at least one wrap.

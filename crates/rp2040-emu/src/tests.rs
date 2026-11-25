@@ -2647,8 +2647,8 @@ mod phase1_wave1 {
         emu.cores[0].regs.msp = 0x2002_0000;
         emu.cores[0].regs.r[13] = emu.cores[0].regs.msp;
         // Enable IRQ flag 0 routing on INT0 (NVIC line 7) only.
-        // Bit 0 = SM0/IRQ-flag-0 in RP2040 INTR layout (RP2040 ds Table 358).
-        emu.bus.write32(PIO0_BASE + 0x12C, 0x001);
+        // Bit 8 = IRQ flag 0 in the RP2040 INTR layout.
+        emu.bus.write32(PIO0_BASE + 0x12C, 0x100);
         // Force PIO0 IRQ flag bit 0 via IRQ_FORCE (offset 0x034).
         emu.bus.write32(PIO0_BASE + 0x034, 0x01);
         // Asserting the IRQ flag means pio_all_idle is false now, so
@@ -2673,8 +2673,8 @@ mod phase1_wave1 {
         emu.cores[0].regs.msp = 0x2002_0000;
         emu.cores[0].regs.r[13] = emu.cores[0].regs.msp;
         // Enable IRQ flag 1 routing on INT1 (NVIC line 10) only.
-        // Bit 1 = SM1/IRQ-flag-1 in RP2040 INTR layout (RP2040 ds Table 358).
-        emu.bus.write32(PIO1_BASE + 0x138, 0x002);
+        // Bit 9 = IRQ flag 1 in the RP2040 INTR layout.
+        emu.bus.write32(PIO1_BASE + 0x138, 0x200);
         // PIO1 IRQ flag bit 1 → NVIC line 10 (PIO1_IRQ_1).
         emu.bus.write32(PIO1_BASE + 0x034, 0x02);
         emu.step().expect("Serial step is infallible");

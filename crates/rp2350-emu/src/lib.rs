@@ -408,6 +408,11 @@ pub struct Emulator {
     /// `run_quantum`'s post-step path. Soft-reboot scenarios that need
     /// to re-init must rebuild the emulator from scratch.
     pub shutdown_requested: bool,
+    /// Timestamped GPIO changes, off until [`Self::gpio_edge_log_enable`].
+    gpio_edges: Option<GpioEdgeLog>,
+    /// True while a quantum's pin changes are logged by [`Self::merge_gpio_edges`] instead of
+    /// by `update_gpio`.
+    gpio_inline: bool,
 }
 
 impl Emulator {
@@ -1042,6 +1047,8 @@ impl Emulator {
             pending_panic_inject: None,
             bus_is_placeholder: false,
             shutdown_requested: self.shutdown_requested,
+            gpio_edges: self.gpio_edges.take(),
+            gpio_inline: false,
         };
         self.threaded = Some(threaded::ThreadedEmulator::from_emulator(seeded));
         // Mark the flat fields as dead state — they now hold
@@ -1085,6 +1092,18 @@ impl Emulator {
     fn tick_peripherals(&mut self, cycles: u32) {
         let gpio_pins = (self.bus.gpio_in.load(Ordering::Relaxed) as u64)
             | ((self.bus.gpio_in_hi.load(Ordering::Relaxed) as u64) << 32);
+        let inline_log = cycles > 1 && self.gpio_edges.is_some();
+        let t_start = self.clock.cycles.saturating_sub(cycles as u64);
+        let (pads_pre, pwm_pre) = if inline_log {
+            for pio in self.bus.pio.iter_mut() {
+                pio.pad_log = Some(Vec::new());
+            }
+            self.bus.pwm.edge_log = Some(Vec::new());
+            self.gpio_inline = true;
+            (self.bus.pio.iter().map(|p| (p.pad_out, p.pad_oe)).collect::<Vec<_>>(), self.pwm_levels_now())
+        } else {
+            (Vec::new(), 0)
+        };
         let resets = self.bus.resets_state;
         // PIO0/1/2 are gated by their RESETS bits — real hardware holds
         // PIO inert while its reset line is asserted. RESET_PIO0..2 are
@@ -1106,6 +1125,9 @@ impl Emulator {
         // Drains alarm-match IRQs into both cores' NVIC pending masks
         // via `assert_irq_shared`.
         self.bus.tick_peripherals(cycles);
+        if inline_log {
+            self.merge_gpio_edges(t_start, cycles, pads_pre, pwm_pre);
+        }
     }
 
     /// Route PIO IRQ flags to the NVIC via INT0_INTE / INT1_INTE masks.
@@ -1248,6 +1270,130 @@ impl Emulator {
             (out_hi & !ext_mask_hi) | (ext_val_hi & ext_mask_hi),
             Ordering::Relaxed,
         );
+        if self.gpio_edges.is_some() && !self.gpio_inline {
+            let pins = (self.bus.gpio_in.load(Ordering::Relaxed) as u64)
+                | ((self.bus.gpio_in_hi.load(Ordering::Relaxed) as u64) << 32);
+            let t = self.clock.cycles;
+            if let Some(log) = self.gpio_edges.as_mut() {
+                log.record(t, pins);
+            }
+        }
+    }
+
+    /// Levels of the PWM-driven pins now, as a pin mask.
+    fn pwm_levels_now(&self) -> u64 {
+        let pwm_pins = self.bus.io_bank0.pwm_pins();
+        let mut levels = 0u64;
+        let mut rem = pwm_pins;
+        while rem != 0 {
+            let n = rem.trailing_zeros();
+            rem &= rem - 1;
+            let slice = if n < 32 { (n as usize >> 1) & 7 } else { 8 + ((n as usize >> 1) & 3) };
+            if self.bus.pwm.channel_level(slice, n & 1 == 1) {
+                levels |= 1u64 << n;
+            }
+        }
+        levels
+    }
+
+    /// The pins [`Self::update_gpio`] would store for these PIO pads, one `(out, oe)` per block
+    /// in the block's own pin numbering, and these PWM pin levels, with SIO and the external
+    /// stimulus as they are now.
+    fn compose_pins(&self, pads: &[(u32, u32)], pwm_levels: u64) -> u64 {
+        let mut out_lo = self.bus.sio.gpio_out & self.bus.sio.gpio_oe;
+        let mut out_hi = 0u32;
+        for (pio, &(out, oe)) in self.bus.pio.iter().zip(pads) {
+            let (pio_out_lo, pio_out_hi) = pio.local_to_physical_pins(out);
+            let (pio_oe_lo, pio_oe_hi) = pio.local_to_physical_pins(oe);
+            out_lo = (out_lo & !pio_oe_lo) | (pio_out_lo & pio_oe_lo);
+            out_hi = (out_hi & !pio_oe_hi) | (pio_out_hi & pio_oe_hi);
+        }
+        let pwm_pins = self.bus.io_bank0.pwm_pins();
+        if pwm_pins != 0 {
+            out_lo = (out_lo & !(pwm_pins as u32)) | (pwm_levels as u32 & pwm_pins as u32);
+            out_hi = (out_hi & !((pwm_pins >> 32) as u32)) | (((pwm_levels >> 32) as u32) & ((pwm_pins >> 32) as u32));
+        }
+        let ext_mask = self.bus.gpio_external_mask;
+        let ext_val = self.bus.gpio_external_in.load(Ordering::Relaxed);
+        let ext_mask_hi = self.bus.gpio_external_mask_hi;
+        let ext_val_hi = self.bus.gpio_external_in_hi.load(Ordering::Relaxed);
+        ((out_lo & !ext_mask) | (ext_val & ext_mask)) as u64
+            | ((((out_hi & !ext_mask_hi) | (ext_val_hi & ext_mask_hi)) as u64) << 32)
+    }
+
+    /// Logs the pin changes of the quantum that just ran, from the PIO pad logs and the PWM edge
+    /// log it collected, in time order. The state is composed from SIO and the external stimulus
+    /// as they are at the quantum end.
+    fn merge_gpio_edges(&mut self, t0: u64, cycles: u32, mut pads: Vec<(u32, u32)>, mut levels: u64) {
+        self.gpio_inline = false;
+        enum Ev {
+            Pio(usize, u32, u32),
+            Pwm(crate::peripherals::pwm::PwmEdge),
+        }
+        let mut ev: Vec<(u32, Ev)> = Vec::new();
+        for (i, p) in self.bus.pio.iter_mut().enumerate() {
+            for (off, out, oe) in p.pad_log.take().unwrap_or_default() {
+                ev.push((off, Ev::Pio(i, out, oe)));
+            }
+        }
+        for e in self.bus.pwm.edge_log.take().unwrap_or_default() {
+            ev.push((e.offset, Ev::Pwm(e)));
+        }
+        ev.sort_by_key(|e| e.0);
+        let pwm_pins = self.bus.io_bank0.pwm_pins();
+        let mut i = 0;
+        while i < ev.len() {
+            let off = ev[i].0;
+            while i < ev.len() && ev[i].0 == off {
+                match &ev[i].1 {
+                    Ev::Pio(b, out, oe) => pads[*b] = (*out, *oe),
+                    Ev::Pwm(e) => {
+                        let (s, c) = (e.slice as u32, e.chan_b as u32);
+                        let (a, b) = if s < 8 { (2 * s + c, 2 * s + c + 16) } else { (32 + 2 * (s - 8) + c, 32 + 2 * (s - 8) + c + 8) };
+                        for n in [a, b] {
+                            if n < 48 && (pwm_pins >> n) & 1 == 1 {
+                                if e.level { levels |= 1u64 << n } else { levels &= !(1u64 << n) }
+                            }
+                        }
+                    }
+                }
+                i += 1;
+            }
+            let pins = self.compose_pins(&pads, levels);
+            if let Some(log) = self.gpio_edges.as_mut() {
+                log.record(t0 + off as u64, pins);
+            }
+        }
+        let now: Vec<(u32, u32)> = self.bus.pio.iter().map(|p| (p.pad_out, p.pad_oe)).collect();
+        let pins = self.compose_pins(&now, self.pwm_levels_now());
+        if let Some(log) = self.gpio_edges.as_mut() {
+            log.record(t0 + cycles as u64, pins);
+        }
+    }
+
+    /// Starts logging changes of the pins in `mask`: `(cycle, pins)` for every update where one
+    /// of them differs from the last logged value, `pins` being all 48 pins at that cycle. The
+    /// state at the start is logged as the first entry. Pins are merged once per quantum, so a
+    /// change inside a quantum is seen at its end; use a quantum of 1 where cycle accuracy
+    /// matters. `cap` bounds the entries kept; past it the oldest are dropped and
+    /// [`Self::gpio_edge_log_dropped`] counts them.
+    pub fn gpio_edge_log_enable(&mut self, mask: u64, cap: usize) {
+        self.gpio_edges = Some(GpioEdgeLog::new(mask, cap));
+        self.update_gpio();
+    }
+
+    pub fn gpio_edge_log_disable(&mut self) {
+        self.gpio_edges = None;
+    }
+
+    /// Takes the entries logged so far, oldest first, leaving the log empty and the last pin
+    /// state remembered so the next entry is still a change.
+    pub fn gpio_edge_log_take(&mut self) -> Vec<(u64, u64)> {
+        self.gpio_edges.as_mut().map(|l| l.take()).unwrap_or_default()
+    }
+
+    pub fn gpio_edge_log_dropped(&self) -> u64 {
+        self.gpio_edges.as_ref().map_or(0, |l| l.dropped)
     }
 
     /// Read a GPIO pin from the merged pin state. Debug-only: asserts
@@ -1719,6 +1865,8 @@ impl EmulatorBuilder {
             ))]
             bus_is_placeholder: false,
             shutdown_requested: false,
+            gpio_edges: None,
+            gpio_inline: false,
         };
         Ok(emu)
     }
@@ -3061,5 +3209,37 @@ mod stage8_lib_residue {
         let emu = Emulator::new(Config::default());
         let _ = emu.core_counters(0);
         let _ = emu.core_counters(1);
+    }
+}
+
+/// Pin changes with the cycle they were merged at; see [`Emulator::gpio_edge_log_enable`].
+struct GpioEdgeLog {
+    mask: u64,
+    last: Option<u64>,
+    cap: usize,
+    dropped: u64,
+    edges: std::collections::VecDeque<(u64, u64)>,
+}
+
+impl GpioEdgeLog {
+    fn new(mask: u64, cap: usize) -> Self {
+        Self { mask, last: None, cap: cap.max(1), dropped: 0, edges: Default::default() }
+    }
+
+    fn record(&mut self, cycle: u64, pins: u64) {
+        let seen = pins & self.mask;
+        if self.last == Some(seen) {
+            return;
+        }
+        self.last = Some(seen);
+        if self.edges.len() == self.cap {
+            self.edges.pop_front();
+            self.dropped += 1;
+        }
+        self.edges.push_back((cycle, pins));
+    }
+
+    fn take(&mut self) -> Vec<(u64, u64)> {
+        self.edges.drain(..).collect()
     }
 }

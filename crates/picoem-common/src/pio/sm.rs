@@ -288,6 +288,13 @@ impl StateMachine {
         self.clkdiv_frac = (val >> 8) as u8;
     }
 
+    /// Clock divider threshold in 1/256 system clocks: INT * 256 + FRAC,
+    /// with INT 0 meaning 256.
+    #[inline]
+    pub(crate) fn clkdiv_threshold(&self) -> u32 {
+        if self.clkdiv_int == 0 { 256 } else { (self.clkdiv_int as u32) * 256 + self.clkdiv_frac as u32 }
+    }
+
     /// Returns true if this SM should execute a PIO cycle this system clock.
     pub fn clock_tick(&mut self) -> bool {
         if !self.enabled {

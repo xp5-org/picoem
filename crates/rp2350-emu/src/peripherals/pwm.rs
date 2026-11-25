@@ -171,6 +171,18 @@ pub struct PwmRegs {
     /// triggers. Routed via [`Self::note_dma_enable`] — see method
     /// doc for the RP2350 register-map assumption.
     warned_dma_enable: [bool; PWM_SLICE_COUNT],
+    /// When `Some`, [`Self::tick`] appends every output change inside the tick. The caller owns it,
+    /// as with `PioBlock::pad_log`.
+    pub edge_log: Option<Vec<PwmEdge>>,
+}
+
+/// An output level change inside one tick: slice, channel, cycles into the tick, new level.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PwmEdge {
+    pub slice: u8,
+    pub chan_b: bool,
+    pub offset: u32,
+    pub level: bool,
 }
 
 impl PwmRegs {
@@ -184,6 +196,7 @@ impl PwmRegs {
             nvic_irq_wrap0,
             nvic_irq_wrap1,
             warned_dma_enable: [false; PWM_SLICE_COUNT],
+            edge_log: None,
         }
     }
 
@@ -425,6 +438,9 @@ impl PwmRegs {
             self.route_irq(irqs);
             return;
         }
+        if self.edge_log.is_some() {
+            self.log_edges(cycles);
+        }
         for slice_idx in 0..PWM_SLICE_COUNT {
             let globally_enabled = (self.en & (1u16 << slice_idx)) != 0;
             let slice = &mut self.slices[slice_idx];
@@ -473,6 +489,50 @@ impl PwmRegs {
             }
         }
         self.route_irq(irqs);
+    }
+}
+
+impl PwmRegs {
+    /// Replays the counter of every running slice over the next `cycles` cycles on a copy of its
+    /// state and logs each change of an output level with the cycle it happens on. Does not move
+    /// the slice; [`Self::tick`] does that. CC and TOP take their buffered values at each wrap,
+    /// as in [`Self::tick`].
+    fn log_edges(&mut self, cycles: u32) {
+        let mut found = Vec::new();
+        for slice_idx in 0..PWM_SLICE_COUNT {
+            let sl = &self.slices[slice_idx];
+            let divisor = (sl.div & 0x0FFF) as u64;
+            if self.en & (1u16 << slice_idx) == 0 || sl.csr & CSR_EN == 0 || divisor == 0 {
+                continue;
+            }
+            let level = |ctr: u64, cc: u32, b: bool| -> bool {
+                let (cmp, inv) = if b { (cc >> 16, sl.csr & CSR_B_INV != 0) } else { (cc & 0xFFFF, sl.csr & CSR_A_INV != 0) };
+                ((ctr as u32) < cmp) != inv
+            };
+            let (mut ctr, mut cc, mut top) = (sl.ctr as u64, sl.cc, sl.top as u64);
+            let mut last = [level(ctr, cc, false), level(ctr, cc, true)];
+            let frac = sl.frac_accum as u64;
+            let advances = (frac + cycles as u64 * 16) / divisor;
+            for j in 1..=advances {
+                ctr += 1;
+                if ctr == top + 1 {
+                    ctr = 0;
+                    cc = sl.cc_buf;
+                    top = sl.top_buf as u64;
+                }
+                let now = [level(ctr, cc, false), level(ctr, cc, true)];
+                for b in 0..2 {
+                    if now[b] != last[b] {
+                        last[b] = now[b];
+                        let offset = ((j * divisor - frac).div_ceil(16) as u32).clamp(1, cycles);
+                        found.push(PwmEdge { slice: slice_idx as u8, chan_b: b == 1, offset, level: now[b] });
+                    }
+                }
+            }
+        }
+        if let Some(log) = self.edge_log.as_mut() {
+            log.extend(found);
+        }
     }
 }
 

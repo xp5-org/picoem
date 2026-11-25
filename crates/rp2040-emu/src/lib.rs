@@ -171,8 +171,12 @@ mod tests;
 #[cfg(test)]
 mod pio_tests;
 
+#[cfg(test)]
+mod block_tests;
+
 pub use self::bus::Bus;
 pub use self::core::CortexM0Plus;
+pub use self::core::block::{BlockMode, BlockStats, Blocks};
 pub use self::memory::{Memory, ROM_SIZE, SRAM_SIZE, bank_for_address};
 
 pub use picoem_common::Pacer;
@@ -217,6 +221,18 @@ struct IdleSnap {
     regs: core::registers::Registers,
     cycles: u64,
     side: [u32; 9],
+    /// Taken in watch mode, with the other core running.
+    watch: bool,
+}
+
+/// A core whose clean polling pass is parked: it is not stepped while the
+/// bus sees nothing that could change what the pass reads.
+#[derive(Clone, Copy)]
+struct Park {
+    /// Master cycle the park began at.
+    since: u64,
+    /// Cycles one pass takes.
+    iter: u64,
 }
 
 /// Exact idle-loop skip for the Serial model. While one core sleeps,
@@ -237,23 +253,134 @@ pub struct IdleSkip {
     pub enabled: bool,
     /// Cycles skipped per core.
     pub skipped_cycles: [u64; 2],
+    /// Off by default. On, a polling pass is also caught while the other
+    /// core runs: watch mode. A watch-mode pass may make no stores and reads
+    /// only ROM and flash, the TIMER raw counters, SIO CPUID and GPIO_IN,
+    /// PIO FSTAT and FLEVEL, and up to 32 SRAM words, read or stored; every
+    /// stored byte must hold its snapshot value again. When it repeats with
+    /// equal state the core is parked: it is not stepped, and the bus checks
+    /// the running core's accesses against those reads. A store to one of
+    /// the words, a read of one the pass stored, any other access to a
+    /// polled PIO block, a GPIO output
+    /// write while GPIO_IN is polled, or a FIFO write unparks it; so does
+    /// the quantum end. The core is then credited with the whole passes
+    /// that fit since it parked and resumes at its loop head. PIO, DMA,
+    /// peripherals and IRQ delivery move only at quantum ends, so the
+    /// result matches running the passes, to within one pass of timing.
+    pub two_core: bool,
+    /// Cycles credited to parked cores, per core.
+    pub parked_cycles: [u64; 2],
+    /// Detector event counts, per core; diagnostics only.
+    pub stats: [IdleStats; 2],
+    /// The watch-mode snapshot that may outlive the quantum end, with the
+    /// fingerprint of its inputs at that end; see `snap_carries`.
+    carry: Option<usize>,
+    carry_vals: Vec<u32>,
+    /// Scratch for `snap_carries`.
+    carry_now: Vec<u32>,
     snap: [Option<IdleSnap>; 2],
+    park: [Option<Park>; 2],
     fails: [u8; 2],
+    /// Loop heads whose last pass came back changed or dirty, per core,
+    /// with the master cycle until which no snapshot is taken there.
+    busy: [[(u32, u64); IDLE_BUSY_HEADS]; 2],
+    /// Loop heads that parked, per core, most recent first. They are
+    /// polls, so a pass that once came back changed does not mark them
+    /// busy.
+    parked_heads: [[u32; IDLE_PARKED_HEADS]; 2],
+    /// Per core, the first loop head after an exception and the core's
+    /// cycle count there, while snapshots wait; see `idle_settling`.
+    settle: [Option<(u32, u64)>; 2],
 }
 
 impl Default for IdleSkip {
     fn default() -> Self {
-        Self { enabled: true, skipped_cycles: [0; 2], snap: [None, None], fails: [0; 2] }
+        Self {
+            enabled: true,
+            skipped_cycles: [0; 2],
+            two_core: false,
+            parked_cycles: [0; 2],
+            stats: [IdleStats::default(); 2],
+            carry: None,
+            carry_vals: Vec::new(),
+            carry_now: Vec::new(),
+            snap: [None, None],
+            park: [None, None],
+            fails: [0; 2],
+            busy: [[(u32::MAX, 0); IDLE_BUSY_HEADS]; 2],
+            parked_heads: [[u32::MAX; IDLE_PARKED_HEADS]; 2],
+            settle: [None; 2],
+        }
     }
+}
+
+/// What the idle-loop detector did, per core.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct IdleStats {
+    /// Snapshots taken at a loop head.
+    pub snaps: u64,
+    /// Snapshots dropped because the pass came back dirty.
+    pub dirty: u64,
+    /// Compares at the snapshot head that found other state.
+    pub changed: u64,
+    /// Compares that skipped passes while the other core slept.
+    pub skips: u64,
+    /// Compares that parked the core.
+    pub parks: u64,
+    /// Snapshots still live at a quantum end and dropped there.
+    pub expired: u64,
+    /// Snapshots carried across a quantum end.
+    pub snap_carried: u64,
+    /// Snapshots dropped by a mode change or the other core's snapshot.
+    pub displaced: u64,
+    /// Parks carried across a quantum end.
+    pub carried: u64,
+    /// Parks ended at a quantum end because the pass read the TIMER.
+    pub ended_timer: u64,
+    /// Parks ended at a quantum end for any other reason.
+    pub ended_other: u64,
+    /// Parks ended inside a quantum by a conflicting access.
+    pub hits: u64,
 }
 
 /// Snapshots taken plus failed compares per core per quantum before the
 /// detector backs off.
 const IDLE_MAX_FAILS: u8 = 12;
 
+/// Loop heads remembered as busy per core, and for how many master cycles.
+/// A head whose pass came back with other registers or with dirt the loop
+/// made itself is computing, not polling; snapshots there are what make
+/// the detector cost time. A polling loop passes on its first compare and
+/// is never marked; one that only sometimes idles parks at most this late.
+/// The table is direct-mapped by [`busy_slot`], so a head that shares a
+/// slot evicts the other.
+const IDLE_BUSY_HEADS: usize = 256;
+const IDLE_BUSY_CYCLES: u64 = 1 << 18;
+const IDLE_PARKED_HEADS: usize = 16;
+
+/// Longest a core waits after an exception before snapshots resume.
+const IDLE_SETTLE_CYCLES: u64 = 1024;
+
+/// The slot of loop head `pc` in the busy table.
+#[inline(always)]
+pub(crate) fn busy_slot(pc: u32) -> usize {
+    ((pc >> 1).wrapping_mul(0x9E37_79B1) >> 24) as usize & (IDLE_BUSY_HEADS - 1)
+}
+
+/// Whether `pc` is a busy head in `table` at master cycle `now`.
+#[inline(always)]
+pub(crate) fn is_busy_head(table: &[(u32, u64)], pc: u32, now: u64) -> bool {
+    let e = table[busy_slot(pc)];
+    e.0 == pc && e.1 > now
+}
+
 pub struct Emulator {
     /// Exact idle-loop skip; see [`IdleSkip`].
     pub idle: IdleSkip,
+    /// Block engine for a core stepping alone; see [`Blocks`]. Off by
+    /// default; `PICOEM_BLOCKS=on|check|off` overrides at build, and
+    /// `PICOEM_JIT=on` compiles hot blocks when built with the `jit` feature.
+    pub blocks: Blocks,
     pub cores: [CortexM0Plus; 2],
     pub bus: Bus,
     pub clock: Clock,
@@ -695,17 +822,27 @@ impl Emulator {
     /// inside an instruction or by a mid-step `Bus::load_*`) drain to
     /// BOTH cores so cross-core SMC observers get evicted on their
     /// next turn.
-    #[inline]
-    fn drain_cache_invalidations(bus: &mut Bus, cores: &mut [CortexM0Plus; 2]) {
+    #[inline(always)]
+    fn drain_cache_invalidations(bus: &mut Bus, cores: &mut [CortexM0Plus; 2], blocks: &mut Blocks) {
+        if !bus.pending_cache_invalidations.is_empty() || bus.pending_invalidation_regions != 0 {
+            Self::drain_cache_invalidations_slow(bus, cores, blocks);
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn drain_cache_invalidations_slow(bus: &mut Bus, cores: &mut [CortexM0Plus; 2], blocks: &mut Blocks) {
         if !bus.pending_cache_invalidations.is_empty() {
             let active = bus.active_core();
             cores[active].invalidate_decode_cache_entries(&bus.pending_cache_invalidations);
+            blocks.invalidate(&bus.pending_cache_invalidations);
             bus.pending_cache_invalidations.clear();
         }
         if bus.pending_invalidation_regions != 0 {
             let regions = bus.pending_invalidation_regions;
             cores[0].invalidate_decode_cache_regions(regions);
             cores[1].invalidate_decode_cache_regions(regions);
+            blocks.clear();
             bus.pending_invalidation_regions = 0;
         }
     }
@@ -716,18 +853,204 @@ impl Emulator {
     #[inline(always)]
     fn idle_track(&mut self, core: usize) -> bool {
         let other = 1 - core;
-        let track = self.idle.enabled && (self.cores[other].is_halted() || self.bus.wfe_waiting[other]);
-        if !track && self.idle.snap[core].is_some() {
+        let other_blocked = self.cores[other].is_halted() || self.bus.wfe_waiting[other];
+        let watch = !other_blocked && self.idle.two_core;
+        // The bus keeps one dirty flag, so in watch mode only one core
+        // holds a snapshot at a time; a parked core has given its up.
+        let track = self.idle.enabled && (other_blocked || (watch && self.idle.snap[other].is_none()));
+        let mode_changed = self.idle.snap[core].as_ref().is_some_and(|s| s.watch != watch);
+        if (!track || mode_changed) && self.idle.snap[core].is_some() {
+            self.idle.stats[core].displaced += 1;
             self.idle_drop(core);
         }
-        self.bus.idle.on = track;
+        // Loop heads are visited whenever the core is eligible, but accesses
+        // are classified only while a snapshot is live: a pass is judged by
+        // the stretch from its snapshot to the compare, nothing before it.
+        // Once the pass is dirty the next visit drops the snapshot whatever
+        // else it reads or stores, so classifying stops there.
+        self.bus.idle.on = track && self.idle.snap[core].is_some() && !self.bus.idle.dirty;
+        self.bus.idle.watch = watch;
         track
+    }
+
+    /// Steps core `k` alone while the other core is halted, in WFE or
+    /// parked. Stops at `target`, when `k` halts, enters WFE or parks, when
+    /// the bus reports a conflict for the parked core, or when the other
+    /// core becomes runnable, a core 1 launch or an event. Returns the
+    /// cycles `k` ran; the master clock has advanced by them.
+    fn run_single(&mut self, k: usize, target: u64) -> u64 {
+        let other = 1 - k;
+        let mut total = 0u64;
+        self.bus.set_active_core(k);
+        self.bus.end_core1_step();
+        let blocks = self.blocks.mode != BlockMode::Off && !self.bus.mmio_trace_enabled;
+        loop {
+            let track = self.idle_track(k);
+            let (pc0, mut c) = if blocks {
+                let budget = target.saturating_sub(self.clock.cycles).max(1);
+                #[cfg(feature = "jit")]
+                let chained = if self.blocks.jit {
+                    let ctl = crate::core::block::ChainCtl {
+                        track,
+                        fails_maxed: self.idle.fails[k] >= IDLE_MAX_FAILS,
+                        snap: self.idle.snap[k].is_some(),
+                        busy: &self.idle.busy[k],
+                        clock: self.clock.cycles,
+                    };
+                    self.cores[k].run_chain(&mut self.bus, &mut self.blocks, budget, &ctl)
+                } else {
+                    None
+                };
+                #[cfg(not(feature = "jit"))]
+                let chained = None;
+                let e = match chained {
+                    Some(e) => e,
+                    None => self.cores[k].run_block(&mut self.bus, &mut self.blocks, budget),
+                };
+                // The clock stands before the block's last instruction, as it
+                // stands before each instruction the interpreter steps.
+                let before = e.cycles - e.last_cycles;
+                total += before;
+                self.clock.cycles = self.clock.cycles.wrapping_add(before);
+                (e.last_pc, e.last_cycles)
+            } else {
+                let pc0 = self.cores[k].regs.pc();
+                (pc0, self.cores[k].step(&mut self.bus) as u64)
+            };
+            self.bus.idle.on = false;
+            let pc1 = self.cores[k].regs.pc();
+            if track && pc1 < pc0 {
+                let room = target.saturating_sub(self.clock.cycles + c);
+                c += self.idle_head_visit(k, pc1, room);
+            }
+            Self::drain_cache_invalidations(&mut self.bus, &mut self.cores, &mut self.blocks);
+            self.maybe_wake_core1(k);
+            if c == 0 {
+                break;
+            }
+            total += c;
+            self.clock.cycles = self.clock.cycles.wrapping_add(c);
+            let other_runs = !self.cores[other].is_halted()
+                && !self.bus.wfe_waiting[other]
+                && self.idle.park[other].is_none();
+            if self.clock.cycles >= target
+                || self.cores[k].is_halted()
+                || self.bus.wfe_waiting[k]
+                || self.idle.park[k].is_some()
+                || (self.idle.park[other].is_some() && self.bus.park[other].hit)
+                || other_runs
+            {
+                break;
+            }
+        }
+        total
+    }
+
+    /// Credits a parked `core` with the whole passes that fit between its
+    /// park and now and keeps it parked; returns the cycles credited.
+    fn settle_park(&mut self, core: usize) -> u64 {
+        let Some(p) = self.idle.park[core].as_mut() else { return 0 };
+        let span = self.clock.cycles.saturating_sub(p.since);
+        let credit = span / p.iter * p.iter;
+        p.since += credit;
+        self.cores[core].cycles += credit;
+        self.idle.parked_cycles[core] += credit;
+        credit
+    }
+
+    /// At a quantum boundary: a park carries on while no IRQ waits for the
+    /// core, the bus saw no conflict, the pass did not read the TIMER, and
+    /// everything it read still holds the value it had at park time.
+    fn park_carries(&mut self, core: usize) -> bool {
+        let w = &self.bus.park[core];
+        if w.hit || w.timer {
+            return false;
+        }
+        if self.bus.nvics[core].pending_and_enabled() != 0 || self.bus.ppb[core].icsr & (1 << 28 | 1 << 26) != 0 {
+            return false;
+        }
+        self.bus.park_inputs_held(core)
+    }
+
+    /// At a quantum boundary, after the parks are settled: a watch-mode
+    /// snapshot carries on while the other core stays parked, its pass so
+    /// far is clean, read no TIMER and is younger than a quantum, no
+    /// exception waits for the core, and everything the pass has read
+    /// holds the value it had at the end of the last quantum. The pass then
+    /// runs as it would have run wholly in the new quantum, so its compare
+    /// means what a compare inside one quantum means.
+    fn snap_carries(&mut self, core: usize) -> bool {
+        let Some(s) = &self.idle.snap[core] else { return false };
+        if !s.watch || self.bus.idle.dirty || self.bus.idle.timer {
+            return false;
+        }
+        // A snapshot holds the one tracking slot, so it carries only while
+        // the other core stays parked and needs no tracking itself, and
+        // only once: a pass longer than a quantum does not park.
+        if self.idle.park[1 - core].is_none() || self.cores[core].cycles - s.cycles >= self.step_quantum as u64 {
+            return false;
+        }
+        if self.bus.nvics[core].pending_and_enabled() != 0 || self.bus.ppb[core].icsr & (1 << 28 | 1 << 26) != 0 {
+            return false;
+        }
+        self.bus.idle_fingerprint(core, &mut self.idle.carry_now);
+        self.idle.carry_now == self.idle.carry_vals
+    }
+
+    /// Ends `core`'s park: credits the whole passes that fit between the
+    /// park and now, and returns them.
+    fn unpark(&mut self, core: usize) -> u64 {
+        let Some(p) = self.idle.park[core].take() else { return 0 };
+        self.bus.park[core].active = false;
+        self.bus.park[core].hit = false;
+        self.bus.refresh_watch_pages();
+        let span = self.clock.cycles.saturating_sub(p.since);
+        let credit = span / p.iter * p.iter;
+        self.cores[core].cycles += credit;
+        self.idle.parked_cycles[core] += credit;
+        self.idle_drop(core);
+        credit
+    }
+
+    fn mark_busy(&mut self, core: usize, pc: u32) {
+        if self.idle.parked_heads[core].contains(&pc) {
+            return;
+        }
+        let now = self.clock.cycles;
+        self.idle.busy[core][busy_slot(pc)] = (pc, now + IDLE_BUSY_CYCLES);
+    }
+
+    #[inline]
+    fn is_busy(&self, core: usize, pc: u32) -> bool {
+        is_busy_head(&self.idle.busy[core], pc, self.clock.cycles)
+    }
+
+    /// Whether a visit to head `pc` takes no snapshot because the core is
+    /// still settling after an exception. The first loop after a handler
+    /// stores and loads what the handler changed, so a pass tracked through
+    /// it comes back changed. Settling starts at the first head after the
+    /// exception and ends when the core is back at that head, or after
+    /// [`IDLE_SETTLE_CYCLES`].
+    fn idle_settling(&mut self, core: usize, pc: u32, exception: bool) -> bool {
+        let now = self.cores[core].cycles;
+        if exception {
+            self.idle.settle[core] = Some((pc, now));
+            return true;
+        }
+        match self.idle.settle[core] {
+            Some((h, t0)) if h != pc && now - t0 < IDLE_SETTLE_CYCLES => true,
+            Some(_) => {
+                self.idle.settle[core] = None;
+                false
+            }
+            None => false,
+        }
     }
 
     fn idle_drop(&mut self, core: usize) {
         if self.idle.snap[core].take().is_some() {
             self.bus.idle.logging = false;
-            self.bus.idle.log.clear();
+            self.bus.idle.clear_log();
         }
     }
 
@@ -736,8 +1059,20 @@ impl Emulator {
     /// whole passes that fit in `room`.
     fn idle_head_visit(&mut self, core: usize, pc: u32, room: u64) -> u64 {
         let clean = !self.bus.idle.dirty;
+        let event = self.bus.idle.event;
+        let exception = self.bus.idle.exception;
         self.bus.idle.dirty = false;
-        if !clean {
+        self.bus.idle.event = false;
+        self.bus.idle.exception = false;
+        if !clean && self.idle.snap[core].is_some() {
+            if exception {
+                self.idle.settle[core] = Some((pc, self.cores[core].cycles));
+            }
+            self.idle.stats[core].dirty += 1;
+            if !event {
+                let head = self.idle.snap[core].as_ref().map_or(pc, |s| s.pc);
+                self.mark_busy(core, head);
+            }
             self.idle_drop(core);
             return 0;
         }
@@ -746,37 +1081,93 @@ impl Emulator {
             if s.pc != pc || s.regs.r[13] != c.regs.r[13] || s.regs.r[14] != c.regs.r[14] {
                 return 0; // another head inside the same clean stretch
             }
-            if s.regs == c.regs
+            if s.watch
+                && s.regs == c.regs
+                && c.pending_fault.is_none()
+                && {
+                    let mut side = s.side;
+                    if self.bus.idle.pio & crate::bus::PARK_SPINLOCK == 0 {
+                        side[0] = 0;
+                    }
+                    side == self.bus.idle_watch_side(core, self.bus.idle.pio)
+                }
+                && self.bus.idle_memory_restored()
+            {
+                let iter = c.cycles - s.cycles;
+                if iter > 0 {
+                    let w = &mut self.bus.park[core];
+                    w.words.clear();
+                    w.words.extend_from_slice(&self.bus.idle.words);
+                    w.pio = self.bus.idle.pio;
+                    w.gpio = self.bus.idle.gpio;
+                    w.stored = self.bus.idle.stored;
+                    w.timer = self.bus.idle.timer;
+                    w.hit = false;
+                    w.active = true;
+                    self.bus.park[core].vals = self.bus.park_fingerprint(core);
+                    self.bus.refresh_watch_pages();
+                    self.idle.park[core] = Some(Park { since: self.clock.cycles, iter });
+                    self.idle.stats[core].parks += 1;
+                    let h = &mut self.idle.parked_heads[core];
+                    if h[0] != pc {
+                        let n = h.iter().position(|&e| e == pc).unwrap_or(IDLE_PARKED_HEADS - 1);
+                        h.copy_within(0..n, 1);
+                        h[0] = pc;
+                    }
+                    self.idle_drop(core);
+                }
+                return 0;
+            }
+            if !s.watch
+                && s.regs == c.regs
                 && c.pending_fault.is_none()
                 && s.side == self.bus.idle_side_state(core)
                 && self.bus.idle_memory_restored()
             {
                 let iter = c.cycles - s.cycles;
-                let skip = if iter > 0 { room / iter * iter } else { 0 };
+                let skip = room.checked_div(iter).map_or(0, |n| n * iter);
                 let c = &mut self.cores[core];
                 c.cycles += skip;
                 self.idle.skipped_cycles[core] += skip;
+                self.idle.stats[core].skips += 1;
                 let now = c.cycles;
                 if let Some(s) = self.idle.snap[core].as_mut() {
                     s.cycles = now;
                 }
-                self.bus.idle.log.clear();
+                self.bus.idle.clear_log();
                 return skip;
             }
-            // Same point in the pass, different state: re-take it here.
+            // Same point in the pass, different state: the loop computes.
+            self.idle.stats[core].changed += 1;
             self.idle.fails[core] += 1;
-        }
-        if self.idle.fails[core] >= IDLE_MAX_FAILS {
+            self.mark_busy(core, pc);
             self.idle_drop(core);
             return 0;
         }
+        if self.idle.fails[core] >= IDLE_MAX_FAILS || self.is_busy(core, pc) {
+            self.idle_drop(core);
+            return 0;
+        }
+        if self.idle_settling(core, pc, exception) {
+            return 0;
+        }
         self.idle.fails[core] += 1;
+        self.idle.stats[core].snaps += 1;
         let other = 1 - core;
-        self.idle.snap[other] = None;
+        if self.idle.snap[other].take().is_some() {
+            self.idle.stats[other].displaced += 1;
+            self.bus.idle.clear_log();
+        }
         let c = &self.cores[core];
-        self.idle.snap[core] = Some(IdleSnap { pc, regs: c.regs, cycles: c.cycles, side: self.bus.idle_side_state(core) });
+        let watch = self.bus.idle.watch;
+        self.idle.snap[core] = Some(IdleSnap { pc, regs: c.regs, cycles: c.cycles, side: self.bus.idle_side_state(core), watch });
         self.bus.idle.logging = true;
-        self.bus.idle.log.clear();
+        self.bus.idle.clear_log();
+        self.bus.idle.stored = false;
+        self.bus.idle.timer = false;
+        self.bus.idle.clear_words();
+        self.bus.idle.pio = 0;
+        self.bus.idle.gpio = false;
         0
     }
 
@@ -800,17 +1191,73 @@ impl Emulator {
         // shared register).
         let mut c0_total: u64 = 0;
         let mut c1_total: u64 = 0;
+        for k in 0..2 {
+            if self.idle.park[k].is_none() {
+                continue;
+            }
+            if self.park_carries(k) {
+                self.idle.stats[k].carried += 1;
+            } else {
+                if self.bus.park[k].timer && !self.bus.park[k].hit {
+                    self.idle.stats[k].ended_timer += 1;
+                } else {
+                    self.idle.stats[k].ended_other += 1;
+                }
+                let credit = self.unpark(k);
+                if k == 0 { c0_total += credit } else { c1_total += credit }
+            }
+        }
         // Memory, pins and peripherals may have changed since the last
-        // quantum: start the idle-loop detector afresh.
-        self.idle_drop(0);
-        self.idle_drop(1);
+        // quantum: start the idle-loop detector afresh, but for a pass whose
+        // inputs so far all held.
+        let keep = self.idle.carry.take().filter(|&k| self.snap_carries(k));
+        // A snapshot that has outlived a whole quantum is not on a pass
+        // short enough to park: its head is busy.
+        for k in 0..2 {
+            if let Some(s) = &self.idle.snap[k]
+                && keep != Some(k)
+                && self.cores[k].cycles - s.cycles >= self.step_quantum as u64
+            {
+                let pc = s.pc;
+                self.mark_busy(k, pc);
+            }
+        }
+        for k in 0..2 {
+            if keep == Some(k) {
+                self.idle.stats[k].snap_carried += 1;
+                continue;
+            }
+            self.idle.stats[k].expired += self.idle.snap[k].is_some() as u64;
+            self.idle_drop(k);
+        }
         self.idle.fails = [0; 2];
-        self.bus.idle.dirty = true;
+        if keep.is_none() {
+            self.bus.idle.dirty = true;
+        }
 
         while self.clock.cycles < target
             && (!self.cores[0].is_halted() || !self.cores[1].is_halted())
         {
-            let c0 = if !self.cores[0].is_halted() && !self.bus.wfe_waiting[0] {
+            for k in 0..2 {
+                if self.idle.park[k].is_some() && self.bus.park[k].hit {
+                    self.idle.stats[k].hits += 1;
+                    let credit = self.unpark(k);
+                    if k == 0 { c0_total += credit } else { c1_total += credit }
+                }
+            }
+            let run0 = !self.cores[0].is_halted() && !self.bus.wfe_waiting[0] && self.idle.park[0].is_none();
+            let run1 = !self.cores[1].is_halted() && !self.bus.wfe_waiting[1] && self.idle.park[1].is_none();
+            if run0 != run1 {
+                // One core can run: step it alone, without the other core's
+                // checks or the bank-contention window, which needs both.
+                let c = self.run_single(if run0 { 0 } else { 1 }, target);
+                if run0 { c0_total += c } else { c1_total += c }
+                if c == 0 {
+                    break;
+                }
+                continue;
+            }
+            let c0 = if !self.cores[0].is_halted() && !self.bus.wfe_waiting[0] && self.idle.park[0].is_none() {
                 self.bus.set_active_core(0);
                 let track = self.idle_track(0);
                 let pc0 = self.cores[0].regs.pc();
@@ -827,14 +1274,14 @@ impl Emulator {
                 // cores so a peer core fetching from the same region
                 // sees the eviction next quantum. Mirrors rp2350_emu
                 // (commit 0c31479, lib.rs §lookup-and-drain).
-                Self::drain_cache_invalidations(&mut self.bus, &mut self.cores);
+                Self::drain_cache_invalidations(&mut self.bus, &mut self.cores, &mut self.blocks);
                 self.maybe_wake_core1(0);
                 c
             } else {
                 0
             };
 
-            let c1 = if !self.cores[1].is_halted() && !self.bus.wfe_waiting[1] {
+            let c1 = if !self.cores[1].is_halted() && !self.bus.wfe_waiting[1] && self.idle.park[1].is_none() {
                 self.bus.set_active_core(1);
                 self.bus.begin_core1_step();
                 let track = self.idle_track(1);
@@ -846,7 +1293,7 @@ impl Emulator {
                     let room = target.saturating_sub(self.clock.cycles + c);
                     c += self.idle_head_visit(1, pc1, room);
                 }
-                Self::drain_cache_invalidations(&mut self.bus, &mut self.cores);
+                Self::drain_cache_invalidations(&mut self.bus, &mut self.cores, &mut self.blocks);
                 self.bus.end_core1_step();
                 self.maybe_wake_core1(1);
                 c
@@ -858,11 +1305,27 @@ impl Emulator {
             };
 
             if c0 == 0 && c1 == 0 {
+                // Every core that could run is parked or blocked: nothing
+                // changes until the quantum ends.
+                if self.idle.park[0].is_some() || self.idle.park[1].is_some() {
+                    self.clock.cycles = target;
+                }
                 break;
             }
             c0_total = c0_total.wrapping_add(c0);
             c1_total = c1_total.wrapping_add(c1);
             self.clock.cycles = self.clock.cycles.wrapping_add(c0.max(c1));
+        }
+        for k in 0..2 {
+            let credit = self.settle_park(k);
+            if k == 0 { c0_total += credit } else { c1_total += credit }
+        }
+        self.idle.carry = None;
+        for k in 0..2 {
+            if self.idle.snap[k].as_ref().is_some_and(|s| s.watch) && !self.bus.idle.dirty && !self.bus.idle.timer {
+                self.bus.idle_fingerprint(k, &mut self.idle.carry_vals);
+                self.idle.carry = Some(k);
+            }
         }
 
         let mut consumed = self.clock.cycles.wrapping_sub(start);
@@ -937,9 +1400,12 @@ impl Emulator {
         // tail-chain scenario's `b .` busy-wait after preamble), the
         // fast path would otherwise trigger and SysTick would never
         // tick. Drop to the slow path whenever SysTick is enabled on
-        // the active core; SysTick-disabled workloads (almost
-        // everything) keep their fast-path eligibility.
-        let systick_idle = !self.bus.systicks[self.bus.active_core()].is_enabled();
+        // either core: SysTick is per-core, and after a two-core
+        // quantum the active core is whichever ran last, so checking
+        // only that one would starve the other core's SysTick.
+        // SysTick-disabled workloads, almost everything, keep their
+        // fast-path eligibility.
+        let systick_idle = !self.bus.systicks[0].is_enabled() && !self.bus.systicks[1].is_enabled();
         if pio_idle && peri_idle && dma_idle && systick_idle && !any_irq {
             self.tick_pio(consumed as u32);
             // Advance lazy-scheduled peripherals (TIMER alarms) by the
@@ -1006,13 +1472,24 @@ impl Emulator {
     /// independently on both cores and firmware routes via
     /// `NVIC_IPR` / `NVIC_ISER` (modelled in
     /// `bus/mod.rs::nvic_mmio_write32` + `nvic_mmio_read32`).
+    ///
+    /// Every source is a level that re-asserts on each poll while its
+    /// condition holds, see `core::nvic`. A line whose handler is active
+    /// on a core is not pended there: on silicon, entry clears pending
+    /// and a level only pends again if it is still high at exception
+    /// return. Pending it while the handler runs, before the handler
+    /// clears the source, would enter the handler a second time with
+    /// nothing to service.
     fn drain_pending_irqs_to_cores(&mut self) {
         if self.bus.irq_pending != 0 {
             let raised = std::mem::replace(&mut self.bus.irq_pending, 0);
-            for irq in 0..crate::irq::IRQ_COUNT {
-                if raised & (1u32 << irq) != 0 {
-                    self.bus.nvics[0].set_pending(irq as u8);
-                    self.bus.nvics[1].set_pending(irq as u8);
+            for c in 0..2 {
+                let active = (self.bus.ppb[c].active >> 16) as u32;
+                let bits = raised & !active;
+                for irq in 0..crate::irq::IRQ_COUNT {
+                    if bits & (1u32 << irq) != 0 {
+                        self.bus.nvics[c].set_pending(irq as u8);
+                    }
                 }
             }
         }
@@ -1026,15 +1503,11 @@ impl Emulator {
     /// runs after this call so the SysTick handler is taken on the
     /// next quantum boundary.
     fn tick_systick(&mut self, c0: u32, c1: u32) {
-        for _ in 0..c0 {
-            if self.bus.systicks[0].tick() {
-                self.bus.ppb[0].icsr |= 1 << 26;
-            }
+        if self.bus.systicks[0].tick_n(c0 as u64) {
+            self.bus.ppb[0].icsr |= 1 << 26;
         }
-        for _ in 0..c1 {
-            if self.bus.systicks[1].tick() {
-                self.bus.ppb[1].icsr |= 1 << 26;
-            }
+        if self.bus.systicks[1].tick_n(c1 as u64) {
+            self.bus.ppb[1].icsr |= 1 << 26;
         }
     }
 
@@ -1276,6 +1749,7 @@ impl Emulator {
             pending_panic_inject: None,
             bus_is_placeholder: false,
             idle: IdleSkip::default(),
+            blocks: Blocks::default(),
         };
         self.threaded = Some(threaded::ThreadedEmulator::from_emulator(seeded));
         self.bus_is_placeholder = true;
@@ -1399,6 +1873,17 @@ impl Emulator {
     /// production code. Direct `cores[1].halt()` skips the `armed`
     /// sync and will silently drift the FSM state against the core's
     /// actual halt status. See HLD 2026.04.16 §5 (invariants).
+    /// Diagnostic for the watch-mode idle skip: while on, every data
+    /// address that made a polling pass dirty is logged with a store flag.
+    pub fn idle_debug_dirty(&mut self, on: bool) {
+        self.bus.idle.debug_dirty = on;
+    }
+
+    /// Takes the addresses logged since [`Self::idle_debug_dirty`] was turned on.
+    pub fn take_idle_dirty_log(&mut self) -> Vec<(u32, bool)> {
+        std::mem::take(&mut self.bus.idle.dirty_log)
+    }
+
     pub fn halt_core1(&mut self) {
         self.assert_not_placeholder();
         self.cores[1].halt();
@@ -1745,7 +2230,14 @@ impl EmulatorBuilder {
             ))]
             bus_is_placeholder: false,
             idle: IdleSkip::default(),
+            blocks: Blocks::default(),
         };
+        emu.blocks.mode = match std::env::var("PICOEM_BLOCKS").as_deref() {
+            Ok("on") | Ok("1") => BlockMode::On,
+            Ok("check") => BlockMode::Check,
+            _ => BlockMode::Off,
+        };
+        emu.blocks.jit = matches!(std::env::var("PICOEM_JIT").as_deref(), Ok("on") | Ok("1"));
         // Default: core 1 halted — Pico SDK wakes it via SIO FIFO.
         // Route through the wrapper so the SIO handshake FSM `armed`
         // flag is in sync (HLD 2026.04.16 §2.1 / §5 invariant).
@@ -2353,8 +2845,7 @@ mod stage5_lib_residue {
 
     /// Drives the slow-path arm of the fast-path gate (line 750 false)
     /// by enabling SysTick on the active core. The predicate
-    /// `systick_idle = !systicks[active].is_enabled()` becomes false,
-    /// forcing the slow branch.
+    /// `systick_idle` becomes false, forcing the slow branch.
     #[test]
     fn step_serial_drops_to_slow_path_when_systick_enabled() {
         let mut emu = Emulator::new(Config::default());
@@ -2411,6 +2902,72 @@ mod stage5_lib_residue {
         let _ = emu.step().unwrap();
     }
 
+    /// Core 0's SysTick must count while core 1 is awake too. After a
+    /// two-core quantum the active core is core 1, so a gate that only
+    /// looked at the active core's SysTick took the fast path and core
+    /// 0's counter never moved.
+    #[test]
+    fn core0_systick_ticks_while_core1_runs() {
+        let mut emu = Emulator::new(Config::default());
+        // Both cores spin on `b .` in SRAM.
+        emu.bus.write16(0x2000_1000, 0xE7FE);
+        emu.bus.write16(0x2000_1010, 0xE7FE);
+        emu.cores[0].regs.set_pc(0x2000_1000);
+        emu.wake_core1();
+        emu.cores[1].regs.set_pc(0x2000_1010);
+        // Core 0 only: ENABLE + CLKSOURCE, no TICKINT, large reload.
+        emu.bus.systicks[0].rvr = 0x00FF_FFFF;
+        emu.bus.systicks[0].cvr = 0x00FF_FFFF;
+        emu.bus.systicks[0].csr = 0b101;
+        for _ in 0..100 {
+            let _ = emu.step().unwrap();
+        }
+        assert!(emu.bus.systicks[0].cvr < 0x00FF_FFFF - 1000, "core 0 SysTick stalled at {:#x}", emu.bus.systicks[0].cvr);
+    }
+
+    /// A level IRQ that stays high while its handler runs must not pend
+    /// again before the handler clears it. TIMER alarm 0's INTR stays
+    /// latched through 40 NOPs, then the handler clears it and counts
+    /// itself. It has to run exactly once at every quantum size.
+    #[test]
+    fn level_irq_does_not_repend_while_its_handler_runs() {
+        const TIMER: u32 = 0x4005_4000;
+        for q in [1u32, 8, 64] {
+            let mut emu = Emulator::new(Config::default());
+            emu.step_quantum = q;
+            let handler = 0x2000_1100u32;
+            for v in 0..48 {
+                emu.bus.write32(0x2000_0000 + 4 * v, 0x2000_1200 | 1);
+            }
+            emu.bus.write16(0x2000_1200, 0xE7FE);
+            emu.bus.write32(0x2000_0000 + 16 * 4, handler | 1);
+            emu.bus.ppb[0].vtor = 0x2000_0000;
+            let mut code = vec![0xBF00u16; 40];
+            // str r2,[r4] clears INTR; adds r5,#1; bx lr
+            code.extend([0x6022, 0x3501, 0x4770]);
+            for (i, hw) in code.iter().enumerate() {
+                emu.bus.write16(handler + 2 * i as u32, *hw);
+            }
+            emu.bus.write16(0x2000_1000, 0xE7FE);
+            let c = &mut emu.cores[0];
+            c.regs.r[2] = 1;
+            c.regs.r[4] = TIMER + 0x34;
+            c.regs.r[13] = 0x2000_3000;
+            c.regs.msp = 0x2000_3000;
+            c.regs.set_pc(0x2000_1000);
+            // TIMER out of reset, alarm 0 enabled in INTE and the NVIC.
+            let r = emu.bus.read32(0x4000_C000);
+            emu.bus.write32(0x4000_C000, r & !(1 << 21));
+            emu.bus.write32(TIMER + 0x38, 1);
+            emu.bus.write32(0xE000_E100, 1);
+            let now = emu.bus.read32(TIMER + 0x28);
+            emu.bus.write32(TIMER + 0x10, now.wrapping_add(3));
+            emu.run(200_000).unwrap();
+            assert_eq!(emu.bus.read32(TIMER + 0x34) & 1, 0, "q {q}: INTR still set, handler never ran");
+            assert_eq!(emu.cores[0].regs.r[5], 1, "q {q}: handler entries");
+        }
+    }
+
     // ------------------- idle-loop skip -------------------
 
     /// Core 0 runs `prog` from SRAM 0x2000_1000 with `regs` preset and core
@@ -2434,6 +2991,173 @@ mod stage5_lib_residue {
         emu.run(cycles).unwrap();
         let mem = emu.bus.read32(0x2000_0100);
         (emu.cores[0].regs.r, emu.cycles(), mem, emu.idle.skipped_cycles[0])
+    }
+
+    /// Core 0 polls a flag in SRAM while core 1 counts to `n` and then
+    /// sets it; both cores then count in r5 until the run ends, so the gap
+    /// between the two counts says how soon core 0 left its loop. Returns core 0's registers, core 1's
+    /// registers and core 0's parked cycles.
+    fn run_two_core_poll(two_core: bool, q: u32, n: u32) -> ([u32; 16], [u32; 16], u64) {
+        let core0 = [
+            0x6808, // 1000: ldr r0, [r1]     poll the flag
+            0x2800, // 1002: cmp r0, #0
+            0xD0FC, // 1004: beq 1000
+            0x3501, // 1006: adds r5, #1
+            0xE7FD, // 1008: b 1006
+        ];
+        let core1 = [
+            0x3301, // 1100: adds r3, #1
+            0x42A3, // 1102: cmp r3, r4
+            0xD1FC, // 1104: bne 1100
+            0x2001, // 1106: movs r0, #1
+            0x6008, // 1108: str r0, [r1]     set the flag
+            0x3501, // 110A: adds r5, #1
+            0xE7FD, // 110C: b 110A
+        ];
+        let mut emu = Emulator::new(Config::default());
+        for (i, hw) in core0.iter().enumerate() {
+            emu.bus.write16(0x2000_1000 + 2 * i as u32, *hw);
+        }
+        for (i, hw) in core1.iter().enumerate() {
+            emu.bus.write16(0x2000_1100 + 2 * i as u32, *hw);
+        }
+        emu.step_quantum = q;
+        emu.idle.two_core = two_core;
+        for (k, pc, sp) in [(0usize, 0x2000_1000u32, 0x2000_2000u32), (1, 0x2000_1100, 0x2000_3000)] {
+            let c = &mut emu.cores[k];
+            c.regs.r[13] = sp;
+            c.regs.msp = sp;
+            c.regs.r[1] = 0x2000_0100;
+            c.regs.r[3] = 0;
+            c.regs.r[4] = n;
+            c.regs.r[5] = 0;
+            c.regs.set_pc(pc);
+        }
+        emu.cores[1].wake();
+        emu.run(n as u64 * 8 + 100_000).unwrap();
+        (emu.cores[0].regs.r, emu.cores[1].regs.r, emu.idle.parked_cycles[0])
+    }
+
+    /// While core 1 runs, core 0's polling pass parks, and core 1's store
+    /// to the polled word unparks it: core 0 leaves its loop as soon after
+    /// the store as without parking, to within one pass. A parked core adds
+    /// no SRAM bank contention, so core 1 itself runs a little faster.
+    #[test]
+    fn two_core_park_sees_other_core_store() {
+        let off = run_two_core_poll(false, 512, 100_000);
+        let on = run_two_core_poll(true, 512, 100_000);
+        assert_eq!(off.2, 0);
+        assert!(on.2 > 100_000, "parked only {} cycles", on.2);
+        assert_eq!(on.1[3], off.1[3], "core 1 counted to n in both runs");
+        assert!(off.0[5] > 1000, "core 0 left the loop: r5 {}", off.0[5]);
+        let lag_off = off.1[5] as i64 - off.0[5] as i64;
+        let lag_on = on.1[5] as i64 - on.0[5] as i64;
+        assert!((lag_on - lag_off).abs() <= 2, "core 0 lag behind the flag: {lag_on} parked, {lag_off} not");
+    }
+
+    /// The park carries over quantum boundaries while nothing it reads
+    /// changes, so short quanta still park almost the whole wait.
+    #[test]
+    fn two_core_park_carries_across_quanta() {
+        let off = run_two_core_poll(false, 256, 200_000);
+        let on = run_two_core_poll(true, 256, 200_000);
+        assert!(on.2 > 400_000, "parked only {} cycles at q256", on.2);
+        let lag_off = off.1[5] as i64 - off.0[5] as i64;
+        let lag_on = on.1[5] as i64 - on.0[5] as i64;
+        assert!((lag_on - lag_off).abs() <= 2, "core 0 lag behind the flag: {lag_on} parked, {lag_off} not");
+    }
+
+    /// Core 0 polls a flag with a delay loop in its pass, `delay` inner
+    /// turns of 3 cycles each. Core 1 counts to `n` and sets the flag, or
+    /// with `n` 0 polls a word nobody sets. Returns both cores' registers,
+    /// core 0's parked cycles and its idle stats.
+    fn run_slow_poll(two_core: bool, q: u32, n: u32, delay: u8) -> ([u32; 16], [u32; 16], u64, IdleStats) {
+        let core0 = [
+            0x6808,                 // 1000: ldr r0, [r1]     poll the flag
+            0x2800,                 // 1002: cmp r0, #0
+            0xD104,                 // 1004: bne 1010
+            0x2600 | delay as u16,  // 1006: movs r6, #delay
+            0x3E01,                 // 1008: subs r6, #1
+            0xD1FD,                 // 100A: bne 1008
+            0xE7F8,                 // 100C: b 1000
+            0xBF00,                 // 100E: nop
+            0x3501,                 // 1010: adds r5, #1
+            0xE7FD,                 // 1012: b 1010
+        ];
+        let counter = [
+            0x3301, // 1100: adds r3, #1
+            0x42A3, // 1102: cmp r3, r4
+            0xD1FC, // 1104: bne 1100
+            0x2001, // 1106: movs r0, #1
+            0x6008, // 1108: str r0, [r1]     set the flag
+            0x3501, // 110A: adds r5, #1
+            0xE7FD, // 110C: b 110A
+        ];
+        let poller = [
+            0x6810, // 1100: ldr r0, [r2]
+            0x2800, // 1102: cmp r0, #0
+            0xD0FC, // 1104: beq 1100
+        ];
+        let core1: &[u16] = if n == 0 { &poller } else { &counter };
+        let mut emu = Emulator::new(Config::default());
+        for (i, hw) in core0.iter().enumerate() {
+            emu.bus.write16(0x2000_1000 + 2 * i as u32, *hw);
+        }
+        for (i, hw) in core1.iter().enumerate() {
+            emu.bus.write16(0x2000_1100 + 2 * i as u32, *hw);
+        }
+        emu.step_quantum = q;
+        emu.idle.two_core = two_core;
+        for (k, pc, sp) in [(0usize, 0x2000_1000u32, 0x2000_2000u32), (1, 0x2000_1100, 0x2000_3000)] {
+            let c = &mut emu.cores[k];
+            c.regs.r[13] = sp;
+            c.regs.msp = sp;
+            c.regs.r[1] = 0x2000_0100;
+            c.regs.r[2] = 0x2000_0200;
+            c.regs.r[3] = 0;
+            c.regs.r[4] = n;
+            c.regs.r[5] = 0;
+            c.regs.set_pc(pc);
+        }
+        emu.cores[1].wake();
+        emu.run(if n == 0 { 400_000 } else { n as u64 * 8 + 20_000 }).unwrap();
+        (emu.cores[0].regs.r, emu.cores[1].regs.r, emu.idle.parked_cycles[0], emu.idle.stats[0])
+    }
+
+    /// A polling pass of 242 cycles fits between a snapshot and the end of
+    /// a 256-cycle quantum only when the snapshot falls in the first 14
+    /// cycles, and without the carry it never parks. While core 1 is
+    /// parked, the snapshot carries across the end as long as what the
+    /// pass read holds, so core 0 parks for most of the run, and both cores
+    /// end where they would without parking.
+    #[test]
+    fn two_core_snapshot_carries_across_quanta() {
+        let off = run_slow_poll(false, 256, 0, 78);
+        let on = run_slow_poll(true, 256, 0, 78);
+        assert!(on.3.snap_carried > 0, "no snapshot carried: {:?}", on.3);
+        assert!(on.2 > 300_000, "parked only {} of 400000 cycles: {:?}", on.2, on.3);
+        assert_eq!(on.0[5], 0, "core 0 never sees the flag");
+        assert_eq!((on.0[0], on.1[0]), (off.0[0], off.1[0]));
+    }
+
+    /// Core 1's store can land anywhere in core 0's tracked pass, after
+    /// the pass read the flag included. The pass must not park on the
+    /// value it read: core 0 leaves its loop at every landing point.
+    #[test]
+    fn two_core_store_during_tracked_pass_is_seen() {
+        for n in 20_000..20_080 {
+            for q in [64, 256] {
+                let off = run_slow_poll(false, q, n, 12);
+                let on = run_slow_poll(true, q, n, 12);
+                let lag_off = off.1[5] as i64 - off.0[5] as i64;
+                let lag_on = on.1[5] as i64 - on.0[5] as i64;
+                assert!(
+                    (lag_on - lag_off).abs() <= 60,
+                    "n {n} q {q}: core 0 lag behind the flag: {lag_on} parked, {lag_off} not, {:?}",
+                    on.3
+                );
+            }
+        }
     }
 
     /// Calls that push different registers into the same stack slots

@@ -42,12 +42,32 @@ pub trait CoreBus {
     #[inline(always)]
     fn idle_mark_dirty(&mut self) {}
 
+    /// [`Self::idle_mark_dirty`] for an exception entry or return.
+    #[inline(always)]
+    fn idle_mark_exception(&mut self) {
+        self.idle_mark_dirty();
+    }
+
+    /// The decode cache now holds an instruction at `pc`: stores to its
+    /// 1 KB page must queue invalidations. A bus that queues them for every
+    /// store keeps the default no-op.
+    #[inline(always)]
+    fn mark_code_page(&mut self, _pc: u32) {}
+
     // --- Memory access ------------------------------------------------
     //
     // Address-only (no `core` argument) — matches the existing RP2040
     // `Bus` inherent shape. Callers are expected to have called
     // `set_active_core(n)` before stepping so the bus knows which core
     // is issuing the access.
+
+    /// Instruction fetch of one halfword on a decode-cache miss. Not a data
+    /// access: a bus whose data accesses feed trackers keeps fetches out of
+    /// them, so the model does not depend on what the cache holds.
+    #[inline(always)]
+    fn fetch16(&mut self, addr: u32) -> u16 {
+        self.read16(addr)
+    }
 
     /// 8-bit load.
     fn read8(&mut self, addr: u32) -> u8;

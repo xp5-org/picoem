@@ -302,7 +302,7 @@ impl UartRegs {
     /// also drops BUSY after the shift register finishes, but the
     /// per-cycle drain model surfaces that through the TX FIFO being
     /// empty, so the two collapse into one signal here.
-    fn fr_read(&self) -> u32 {
+    pub(crate) fn fr_read(&self) -> u32 {
         let mut fr = 0u32;
         // CTS is tied high because we don't model flow control.
         fr |= UARTFR_CTS;

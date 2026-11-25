@@ -310,7 +310,13 @@ impl Dma {
     /// `tick_dma` can issue transfers.
     #[inline]
     pub fn is_idle(&self) -> bool {
-        !self.channels.iter().any(|c| c.busy) && self.intr == 0
+        !self.any_busy() && self.intr == 0
+    }
+
+    /// Whether some channel has a transfer under way.
+    #[inline]
+    pub fn any_busy(&self) -> bool {
+        self.channels.iter().any(|c| c.busy)
     }
 
     /// Borrow a channel read-only (exposed for tests / observability).
