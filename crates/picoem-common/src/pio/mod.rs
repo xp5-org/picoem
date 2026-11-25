@@ -419,6 +419,11 @@ impl PioBlock {
         // first non-quiescent SM clocks on then runs through the per-cycle
         // path, in SM order as always. A free-running output SM such as I2S
         // then costs O(its PIO clocks) instead of O(system clocks).
+        #[cfg(not(feature = "pio-pad-diag"))]
+        if self.sm_enabled_mask.count_ones() == 1 && self.pad_log.is_none() {
+            self.step_solo(n, gpio_pins);
+            return;
+        }
         let mut left = n;
         let mut last_pads = (self.pad_out, self.pad_oe);
         while left > 0 {
@@ -432,7 +437,14 @@ impl PioBlock {
                     self.merge_pin_outputs();
                     return;
                 }
-                let skip = self.cycles_to_next_active_tick(gpio_pins).saturating_sub(1).min(left - 1);
+                let next = self.cycles_to_next_active_tick(gpio_pins);
+                if next > left {
+                    // No SM executes in the rest of the call.
+                    self.skip_idle_cycles(left, gpio_pins);
+                    self.merge_pin_outputs();
+                    return;
+                }
+                let skip = next.saturating_sub(1).min(left - 1);
                 if skip > 0 {
                     self.skip_idle_cycles(skip, gpio_pins);
                     left -= skip;
@@ -448,6 +460,37 @@ impl PioBlock {
                 }
             }
         }
+    }
+
+    /// [`Self::step_n_with_pins`] with one SM enabled: it runs from one PIO
+    /// clock to the next. Nothing else in the block executes, and the GPIO
+    /// sample is fixed for the call, so the end state matches the
+    /// per-cycle loop: the pads are the latches the SM wrote last.
+    #[cfg(not(feature = "pio-pad-diag"))]
+    fn step_solo(&mut self, n: u32, gpio_pins: u64) {
+        let gpio_in = self.local_gpio_window(gpio_pins);
+        let i = self.sm_enabled_mask.trailing_zeros() as usize;
+        let mut left = n;
+        while left > 0 {
+            let sm = &mut self.sm[i];
+            let t = sm.clkdiv_threshold();
+            if sm.clkdiv_acc < t && sm.quiescent(self.irq_flags, gpio_in) {
+                let ok = sm.bulk_stall(left);
+                debug_assert!(ok);
+                break;
+            }
+            // System clocks until the divider yields a PIO clock, counting
+            // the clock it happens on.
+            let k = if sm.clkdiv_acc >= t { 1 } else { (t - sm.clkdiv_acc).div_ceil(256) };
+            if k > left {
+                sm.clkdiv_acc += 256 * left;
+                break;
+            }
+            sm.clkdiv_acc = sm.clkdiv_acc + 256 * k - t;
+            left -= k;
+            sm.execute_cycle(&self.instr_mem, &mut self.irq_flags, gpio_in, &mut self.shared_pin_values, &mut self.shared_pin_dirs);
+        }
+        self.merge_pin_outputs();
     }
 
     /// System clocks until the first non-quiescent enabled SM gets a PIO

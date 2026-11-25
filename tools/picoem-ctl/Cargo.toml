@@ -1,0 +1,18 @@
+[package]
+name = "picoem-ctl"
+version = "0.1.0"
+edition = "2021"
+description = "Runs an RP2350 firmware in picoem and serves the 86Box RMM JSON-RPC dialect on a TCP port"
+publish = false
+
+[dependencies]
+# Lives in the picoem checkout: tools/picoem-ctl.
+rp2350-emu = { path = "../../crates/rp2350-emu" }
+
+[workspace]
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"

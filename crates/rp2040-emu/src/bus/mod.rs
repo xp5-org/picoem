@@ -289,6 +289,8 @@ pub(crate) struct ParkWatch {
     /// [`Bus::park_fingerprint`] at park time, compared at each quantum
     /// boundary to decide whether the park carries over.
     pub vals: Vec<u32>,
+    /// [`Bus::ext_sram_writes`] when the words last matched `vals`.
+    pub ext_seen: u64,
 }
 
 /// Whether an access by the running core could change what a watch-mode
@@ -737,6 +739,11 @@ pub struct Bus {
     /// 1 KB SRAM pages holding a word some active park watches; the block
     /// engine's SRAM fast path skips them. A superset is safe.
     pub(crate) watch_pages: [u64; 5],
+    /// SRAM writes that reach no park check: every SRAM write through the
+    /// bus but a core's, which DMA and harnesses make, and the pokes. A
+    /// parked core's words change only through these or through an access
+    /// [`Self::park_check`] sees, so while the count stands they hold.
+    pub(crate) ext_sram_writes: u64,
     /// One byte per 1 KB SRAM page for compiled blocks: bit 0, loads take
     /// the slow path; bit 1, stores do. Watched pages set both. A page
     /// holding code sets bits 1 and 2 on itself and both neighbours, which
@@ -821,6 +828,7 @@ impl Bus {
             pending_cache_invalidations: Vec::with_capacity(16),
             code_pages: vec![0; 3 * 65536 / 64],
             watch_pages: [0; 5],
+            ext_sram_writes: 0,
             jit_pages: [0; JIT_PAGES],
             jit_timer_cache: std::cell::Cell::new((u64::MAX, 0, 0)),
             pending_invalidation_regions: 0,
@@ -1005,6 +1013,7 @@ impl Bus {
 
     pub fn poke32(&mut self, addr: u32, value: u32) {
         if (addr >> 28) == 0x2 {
+            self.ext_sram_writes += 1;
             self.memory.sram_write32(addr & 0x00FF_FFFF, value);
         } else if (XIP_SRAM_BASE..XIP_SRAM_END).contains(&addr) {
             let off = (addr - XIP_SRAM_BASE) as usize;
@@ -1347,7 +1356,7 @@ impl Bus {
     /// the polled PIO and UART status, GPIO_IN, and the core's side state.
     pub(crate) fn park_fingerprint(&self, core: usize) -> Vec<u32> {
         let mut v = Vec::new();
-        self.inputs_visit(true, core, |x| {
+        self.inputs_visit(true, false, core, |x| {
             v.push(x);
             true
         });
@@ -1356,37 +1365,45 @@ impl Bus {
 
     /// Whether [`Self::park_fingerprint`] still equals the one taken at
     /// park time.
-    pub(crate) fn park_inputs_held(&self, core: usize) -> bool {
-        let vals = &self.park[core].vals;
-        let mut i = 0;
-        let held = self.inputs_visit(true, core, |x| {
+    /// The words are read again only after an SRAM write no park check saw.
+    pub(crate) fn park_inputs_held(&mut self, core: usize) -> bool {
+        let p = &self.park[core];
+        let words_held = p.ext_seen == self.ext_sram_writes;
+        let vals = &p.vals;
+        let mut i = if words_held { p.words.len() } else { 0 };
+        let held = self.inputs_visit(true, words_held, core, |x| {
             let ok = vals.get(i) == Some(&x);
             i += 1;
             ok
         });
-        held && i == vals.len()
+        let held = held && i == vals.len();
+        if held {
+            self.park[core].ext_seen = self.ext_sram_writes;
+        }
+        held
     }
 
     /// [`Self::park_fingerprint`] for the pass `core` is tracking now: what
     /// it has read since its snapshot.
     pub(crate) fn idle_fingerprint(&self, core: usize, out: &mut Vec<u32>) {
         out.clear();
-        self.inputs_visit(false, core, |x| {
+        self.inputs_visit(false, false, core, |x| {
             out.push(x);
             true
         });
     }
 
     /// Feeds the inputs of `core`'s park when `park`, else of the tracked
-    /// pass, to `f` in a fixed order; stops and returns false as soon as
-    /// `f` does.
-    fn inputs_visit(&self, park: bool, core: usize, mut f: impl FnMut(u32) -> bool) -> bool {
+    /// pass, to `f` in a fixed order, leaving out the SRAM words when
+    /// `skip_words`; stops and returns false as soon as `f` does.
+    fn inputs_visit(&self, park: bool, skip_words: bool, core: usize, mut f: impl FnMut(u32) -> bool) -> bool {
         let (words, blocks, gpio) = if park {
             let p = &self.park[core];
             (&p.words[..], p.pio, p.gpio)
         } else {
             (&self.idle.words[..], self.idle.pio, self.idle.gpio)
         };
+        let words = if skip_words { &[][..] } else { words };
         for &w in words {
             let off = w & 0x00FF_FFFF;
             if !f(if (off as usize) + 4 <= SRAM_SIZE { self.memory.sram_read32(off) } else { 0 }) {
@@ -2143,6 +2160,7 @@ impl Bus {
                     // map to the same backing storage — RP2040 datasheet
                     // §2.1.2 calls out alias bits [25:24] as bank-striping
                     // flavours for DMA, not peripheral XOR/SET/CLR.
+                    self.ext_sram_writes += 1;
                     self.memory.sram_write8(off, val);
                     self.invalidate_pc_range(addr, 1);
                 } else {
@@ -2244,6 +2262,7 @@ impl Bus {
                     self.last_access_cycles += self.note_sram_access(addr);
                     // All four SRAM alias windows map to the same storage
                     // (RP2040 datasheet §2.1.2).
+                    self.ext_sram_writes += 1;
                     self.memory.sram_write16(off, val);
                     self.invalidate_pc_range(addr, 2);
                 } else {
@@ -2349,6 +2368,7 @@ impl Bus {
                     self.last_access_cycles += self.note_sram_access(addr);
                     // All four SRAM alias windows map to the same storage
                     // (RP2040 datasheet §2.1.2).
+                    self.ext_sram_writes += 1;
                     self.memory.sram_write32(off, val);
                     self.invalidate_pc_range(addr, 4);
                 } else {
@@ -2890,17 +2910,26 @@ impl CoreBus for Bus {
     #[inline(always)]
     fn write8(&mut self, addr: u32, val: u8) {
         self.idle_write(addr, 1);
-        Bus::write8(self, addr, val)
+        // The core's own stores are park-checked in `idle_write`.
+        let n = self.ext_sram_writes;
+        Bus::write8(self, addr, val);
+        self.ext_sram_writes = n;
     }
     #[inline(always)]
     fn write16(&mut self, addr: u32, val: u16) {
         self.idle_write(addr, 2);
-        Bus::write16(self, addr, val)
+        // The core's own stores are park-checked in `idle_write`.
+        let n = self.ext_sram_writes;
+        Bus::write16(self, addr, val);
+        self.ext_sram_writes = n;
     }
     #[inline(always)]
     fn write32(&mut self, addr: u32, val: u32) {
         self.idle_write(addr, 4);
-        Bus::write32(self, addr, val)
+        // The core's own stores are park-checked in `idle_write`.
+        let n = self.ext_sram_writes;
+        Bus::write32(self, addr, val);
+        self.ext_sram_writes = n;
     }
     #[inline(always)]
     fn idle_mark_dirty(&mut self) {

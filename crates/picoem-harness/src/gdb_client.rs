@@ -155,7 +155,7 @@ impl QemuProfile {
         // actively; phase-2 requires QEMU to do the same so the diff
         // lines up rather than trapping. Confirmed accepted as property
         // by QEMU 10.2 (probed 2026-04-18).
-        cpu: "rv32,a=true,m=true,c=true,zicsr=true,zifencei=true,f=false,d=false,zfa=false,pmp=true",
+        cpu: "rv32,a=true,m=true,c=true,zicsr=true,zifencei=true,zba=true,zbb=true,zbs=true,zbkb=true,f=false,d=false,zfa=false,pmp=true",
         gdb_port: 3335,
         bios: Some("none"),
         loader_addr: Some(0x8000_0000),

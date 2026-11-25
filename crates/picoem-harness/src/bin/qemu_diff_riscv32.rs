@@ -165,11 +165,12 @@ fn parse_class(s: &str) -> Result<RiscvClass, String> {
         "zifencei" => Ok(RiscvClass::Zifencei),
         "csr-sideeffect" => Ok(RiscvClass::CsrSideEffect),
         "pmp" => Ok(RiscvClass::Pmp),
+        "zb" => Ok(RiscvClass::Zb),
         other => Err(format!(
             "invalid --class value '{other}' (expected one of: \
              rv32i-alu | rv32i-mem | rv32i-misaligned | rv32i-branch | \
              rv32i-upper | rv32m | rv32a | rv32c | zicsr | zifencei | \
-             csr-sideeffect | pmp)"
+             csr-sideeffect | pmp | zb)"
         )),
     }
 }
@@ -252,7 +253,7 @@ fn print_help() {
          qemu_diff_riscv32 --proxy-self-check-only       Run §4.1 proxy self-check and exit\n\n\
          Class names:\n  \
          rv32i-alu | rv32i-mem | rv32i-misaligned | rv32i-branch | rv32i-upper |\n  \
-         rv32m | rv32a | rv32c | zicsr | zifencei | csr-sideeffect | pmp"
+         rv32m | rv32a | rv32c | zicsr | zifencei | csr-sideeffect | pmp | zb"
     );
 }
 
@@ -828,6 +829,7 @@ fn dispatch_per_class(c: RiscvClass, rng: &mut StdRng, count: usize) -> Vec<Risc
         RiscvClass::Zifencei => riscv_gen::gen_fuzz_zifencei(rng, count),
         RiscvClass::CsrSideEffect => riscv_gen::gen_fuzz_csr_side_effect(rng, count),
         RiscvClass::Pmp => riscv_gen::gen_fuzz_pmp(rng, count),
+        RiscvClass::Zb => riscv_gen::gen_fuzz_zb(rng, count),
     }
 }
 
@@ -845,6 +847,7 @@ fn class_to_str(c: RiscvClass) -> &'static str {
         RiscvClass::Zifencei => "zifencei",
         RiscvClass::CsrSideEffect => "csr-sideeffect",
         RiscvClass::Pmp => "pmp",
+        RiscvClass::Zb => "zb",
     }
 }
 

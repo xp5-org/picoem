@@ -401,6 +401,17 @@ impl Tr<'_, '_> {
                 t.b.ins().jump(out, &[]);
                 t.b.switch_to_block(out);
                 t.emit_exit(op, i, ipc, acc, c, exit);
+            } else if op.k == K::BCond {
+                // The block follows one edge; the other one leaves it.
+                let follows_taken = op.imm == blk.pc.wrapping_add(blk.ops[i + 1].off as u32);
+                let taken = t.cond(op.m);
+                let leave = if follows_taken { t.b.ins().bxor_imm_u(taken, 1) } else { taken };
+                let out = t.b.create_block();
+                let next = t.b.create_block();
+                t.b.ins().brif(leave, out, &[], next, &[]);
+                t.b.switch_to_block(out);
+                t.emit_exit(op, i, ipc, acc, c, exit);
+                t.b.switch_to_block(next);
             } else if super::plain_cycles(op).is_none() {
                 let out = t.b.create_block();
                 let next = t.b.create_block();

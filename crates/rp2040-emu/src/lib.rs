@@ -361,6 +361,19 @@ const IDLE_PARKED_HEADS: usize = 16;
 /// Longest a core waits after an exception before snapshots resume.
 const IDLE_SETTLE_CYCLES: u64 = 1024;
 
+/// The cycles of the whole passes of `iter` cycles in `span`. A quantum
+/// is usually under two passes, so the division is rare.
+#[inline(always)]
+fn whole_passes(span: u64, iter: u64) -> u64 {
+    if span < iter {
+        0
+    } else if span < 2 * iter {
+        iter
+    } else {
+        span / iter * iter
+    }
+}
+
 /// The slot of loop head `pc` in the busy table.
 #[inline(always)]
 pub(crate) fn busy_slot(pc: u32) -> usize {
@@ -640,6 +653,7 @@ impl Emulator {
                 self.invalidate_decode_caches_region(crate::bus::invalidation_regions::ROM);
             }
             0x2 => {
+                self.bus.ext_sram_writes += 1;
                 for (i, &byte) in data.iter().enumerate() {
                     let a = addr.wrapping_add(i as u32);
                     self.bus.memory.sram_write8(a & 0x00FF_FFFF, byte);
@@ -893,7 +907,7 @@ impl Emulator {
                     let ctl = crate::core::block::ChainCtl {
                         track,
                         fails_maxed: self.idle.fails[k] >= IDLE_MAX_FAILS,
-                        snap: self.idle.snap[k].is_some(),
+                        snap: self.idle.snap[k].as_ref().map(|s| (s.pc, s.regs.r[13], s.regs.r[14])),
                         busy: &self.idle.busy[k],
                         clock: self.clock.cycles,
                     };
@@ -951,7 +965,7 @@ impl Emulator {
     fn settle_park(&mut self, core: usize) -> u64 {
         let Some(p) = self.idle.park[core].as_mut() else { return 0 };
         let span = self.clock.cycles.saturating_sub(p.since);
-        let credit = span / p.iter * p.iter;
+        let credit = whole_passes(span, p.iter);
         p.since += credit;
         self.cores[core].cycles += credit;
         self.idle.parked_cycles[core] += credit;
@@ -1005,7 +1019,7 @@ impl Emulator {
         self.bus.park[core].hit = false;
         self.bus.refresh_watch_pages();
         let span = self.clock.cycles.saturating_sub(p.since);
-        let credit = span / p.iter * p.iter;
+        let credit = whole_passes(span, p.iter);
         self.cores[core].cycles += credit;
         self.idle.parked_cycles[core] += credit;
         self.idle_drop(core);
@@ -1105,6 +1119,7 @@ impl Emulator {
                     w.hit = false;
                     w.active = true;
                     self.bus.park[core].vals = self.bus.park_fingerprint(core);
+                    self.bus.park[core].ext_seen = self.bus.ext_sram_writes;
                     self.bus.refresh_watch_pages();
                     self.idle.park[core] = Some(Park { since: self.clock.cycles, iter });
                     self.idle.stats[core].parks += 1;
@@ -3065,6 +3080,80 @@ mod stage5_lib_residue {
         let lag_off = off.1[5] as i64 - off.0[5] as i64;
         let lag_on = on.1[5] as i64 - on.0[5] as i64;
         assert!((lag_on - lag_off).abs() <= 2, "core 0 lag behind the flag: {lag_on} parked, {lag_off} not");
+    }
+
+    /// Core 0 polls the flag at 0x2000_0100 while core 1 counts forever.
+    /// After 200000 cycles `set` writes the flag from outside the cores;
+    /// returns core 0's parked cycles at that point and the quanta of 512
+    /// cycles until it has left its loop.
+    fn run_poll_external_set(set: fn(&mut Emulator)) -> (u64, u32) {
+        let core0 = [
+            0x6808, // 1000: ldr r0, [r1]     poll the flag
+            0x2800, // 1002: cmp r0, #0
+            0xD0FC, // 1004: beq 1000
+            0x3501, // 1006: adds r5, #1
+            0xE7FD, // 1008: b 1006
+        ];
+        let core1 = [
+            0x3301, // 1100: adds r3, #1
+            0xE7FD, // 1102: b 1100
+        ];
+        let mut emu = Emulator::new(Config::default());
+        for (i, hw) in core0.iter().enumerate() {
+            emu.bus.write16(0x2000_1000 + 2 * i as u32, *hw);
+        }
+        for (i, hw) in core1.iter().enumerate() {
+            emu.bus.write16(0x2000_1100 + 2 * i as u32, *hw);
+        }
+        emu.step_quantum = 512;
+        emu.idle.two_core = true;
+        for (k, pc, sp) in [(0usize, 0x2000_1000u32, 0x2000_2000u32), (1, 0x2000_1100, 0x2000_3000)] {
+            let c = &mut emu.cores[k];
+            c.regs.r[13] = sp;
+            c.regs.msp = sp;
+            c.regs.r[1] = 0x2000_0100;
+            c.regs.set_pc(pc);
+        }
+        emu.cores[1].wake();
+        emu.run(200_000).unwrap();
+        let parked = emu.idle.parked_cycles[0];
+        set(&mut emu);
+        let mut quanta = 0;
+        while emu.cores[0].regs.r[5] == 0 && quanta < 1000 {
+            emu.run(512).unwrap();
+            quanta += 1;
+        }
+        (parked, quanta)
+    }
+
+    /// A parked core's word written by DMA, by a harness through the bus
+    /// or by a poke ends the park by the next quantum boundary, although no
+    /// core store to it reached the park check.
+    #[test]
+    fn two_core_park_sees_external_sram_writes() {
+        fn dma(emu: &mut Emulator) {
+            emu.bus.write32(crate::bus::RESETS_BASE + 0x3000, 1 << crate::bus::peripheral_dispatch::RESET_DMA);
+            emu.bus.write32(0x2000_0200, 1);
+            let ch = crate::bus::DMA_BASE;
+            // EN, word size, TREQ always ready, no chain: copy one word.
+            let ctrl = 1 | 2 << 2 | (crate::dreq::DREQ_FORCE as u32) << 15;
+            emu.bus.write32(ch, 0x2000_0200);
+            emu.bus.write32(ch + 4, 0x2000_0100);
+            emu.bus.write32(ch + 8, 1);
+            emu.bus.write32(ch + 0xC, ctrl);
+        }
+        fn bus(emu: &mut Emulator) {
+            emu.bus.write32(0x2000_0100, 1);
+        }
+        fn poke(emu: &mut Emulator) {
+            emu.poke(0x2000_0100, 1);
+        }
+        let sets: [(&str, fn(&mut Emulator)); 3] = [("dma", dma), ("bus", bus), ("poke", poke)];
+        for (name, set) in sets {
+            let (parked, quanta) = run_poll_external_set(set);
+            assert!(parked > 100_000, "{name}: core 0 parked only {parked} cycles before the write");
+            assert!(quanta <= 3, "{name}: core 0 left its loop after {quanta} quanta");
+        }
     }
 
     /// Core 0 polls a flag with a delay loop in its pass, `delay` inner

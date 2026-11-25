@@ -49,8 +49,9 @@ const JIT_HOT: u32 = 64;
 pub const BLOCK_MAX_OPS: usize = 32;
 /// Direct-mapped block slots per core.
 const SLOTS: usize = 16384;
-/// Largest byte span of a block: 32 wide instructions.
-const BLOCK_MAX_BYTES: u32 = 4 * BLOCK_MAX_OPS as u32;
+/// Largest byte span of a block, from its entry to the end of its last
+/// instruction; forward branches it follows count the bytes they skip.
+const BLOCK_MAX_BYTES: u32 = 256;
 
 /// Whether `run_single` runs blocks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -189,12 +190,13 @@ pub(crate) struct Block {
     pub entry_need: u64,
 }
 
-/// The cycles of an op that never ends a compiled block early, or `None`
-/// for a checkpoint: a memory access, whose slow path may ask for an
-/// exit and which may fault, and an interpreter op, whose cycles vary.
-/// Compiled code tests the exit flag and the budget only after
-/// checkpoints, so a run of plain ops between two checkpoints goes
-/// unchecked. Branches end a block and are never followed by an op.
+/// The cycles of an op that never ends a compiled block early on the
+/// budget or the exit flag, or `None` for a checkpoint: a memory access,
+/// whose slow path may ask for an exit and which may fault, and an
+/// interpreter op, whose cycles vary. Compiled code tests the exit flag
+/// and the budget only after checkpoints, so a run of plain ops between
+/// two checkpoints goes unchecked. A branch inside a block counts its
+/// taken cycles; when it leaves the block's path the block exits there.
 #[cfg(feature = "jit")]
 pub(crate) fn plain_cycles(op: &Op) -> Option<u64> {
     match op.k {
@@ -223,6 +225,14 @@ pub(crate) fn plain_cycles(op: &Op) -> Option<u64> {
         K::Bl => Some(4),
         _ => Some(1),
     }
+}
+
+/// A run of `b` that stopped after `done` ops left it through a branch
+/// before its last op. Branches are plain, so no budget or exit-flag stop
+/// ends a run on one.
+#[cfg(feature = "jit")]
+fn side_exit(b: &Block, done: usize) -> bool {
+    done > 0 && done < b.ops.len() && b.ops[done - 1].k == K::BCond
 }
 
 /// For each op of `ops`, the cycles of the plain ops that follow it up to
@@ -330,8 +340,10 @@ pub(crate) struct ChainCtl<'a> {
     /// The failure limit is reached, so a visit without a snapshot is a
     /// no-op.
     pub fails_maxed: bool,
-    /// A snapshot is live, so every visit counts.
-    pub snap: bool,
+    /// The live snapshot's head PC, SP and LR. A visit to another head, or
+    /// with another SP or LR, is a no-op while the pass is clean; any other
+    /// visit counts.
+    pub snap: Option<(u32, u32, u32)>,
     /// Busy heads and the clock until which each stays busy.
     pub busy: &'a [(u32, u64)],
     /// The master clock at the chain's start.
@@ -508,7 +520,7 @@ fn build(bus: &mut Bus, pc: u32) -> Option<Block> {
         let Some(hw0) = bus.peek_code16(cur) else { break };
         let wide = is_wide(hw0);
         let len = if wide { 4 } else { 2 };
-        if cur.wrapping_add(len) > page_end || page_end == 0 {
+        if cur.wrapping_add(len) > page_end || page_end == 0 || cur.wrapping_add(len) - pc > BLOCK_MAX_BYTES {
             break;
         }
         let hw1 = if wide {
@@ -523,7 +535,10 @@ fn build(bus: &mut Bus, pc: u32) -> Option<Block> {
         ops.push(op);
         cur += len;
         if op.k.ends_block() {
-            break;
+            match follow(bus, &op, cur) {
+                Some(next) => cur = next,
+                None => break,
+            }
         }
     }
     if ops.is_empty() {
@@ -532,6 +547,24 @@ fn build(bus: &mut Bus, pc: u32) -> Option<Block> {
     bus.set_code_page(pc);
     bus.set_code_page(cur - 1);
     Some(Block::new(pc, cur, ops.into_boxed_slice()))
+}
+
+/// Where a block goes on after branch `op`, whose next instruction is at
+/// `next`, or `None` when the branch ends it. A block follows only forward
+/// branches, so it never holds a loop head's backward branch except as its
+/// last op; `build` keeps the path inside the block's page and byte span.
+/// B goes on at its target. BCond goes on at its fall-through and leaves
+/// the block when taken, except before an unconditional B it skips, the
+/// way GCC jumps to far code: then the taken edge is the one followed.
+fn follow(bus: &mut Bus, op: &Op, next: u32) -> Option<u32> {
+    match op.k {
+        K::B if op.imm >= next => Some(op.imm),
+        K::BCond if op.imm > next => {
+            let skips_b = op.imm == next + 2 && bus.peek_code16(next).is_some_and(|h| h >> 11 == 0b11100);
+            Some(if skips_b { op.imm } else { next })
+        }
+        _ => None,
+    }
 }
 
 /// Lowers one instruction at `pc`; `off` is its offset in the block.
@@ -857,8 +890,8 @@ impl CortexM0Plus {
     pub(crate) fn run_chain(&mut self, bus: &mut Bus, blocks: &mut Blocks, budget: u64, ctl: &ChainCtl<'_>) -> Option<Exit> {
         let core = self.core_id as usize;
         // With idle tracking live fast accesses call the tracking hooks
-        // themselves; `ctl.snap` then ends the chain at every backward
-        // branch, where the visit counts.
+        // themselves; with `ctl.snap` set the chain ends at the backward
+        // branches whose visit counts.
         let fast = bus.jit_fast();
         if blocks.mode != BlockMode::On || self.halted || bus.mmio_trace_enabled || bus.contention_check_active || blocks.cache[core].is_empty() {
             blocks.stats.chain_stops[0] += 1;
@@ -932,7 +965,7 @@ impl CortexM0Plus {
                 3
             } else if total >= budget {
                 4
-            } else if !b.chain || st.ops as usize != b.ops.len() {
+            } else if !(st.ops as usize == b.ops.len() && b.chain || side_exit(b, st.ops as usize)) {
                 5
             } else {
                 0
@@ -943,12 +976,20 @@ impl CortexM0Plus {
             }
             if ctl.track && pc1 < last_pc {
                 let now = ctl.clock + total - last_cycles;
-                if ctl.snap || !(ctl.fails_maxed || crate::is_busy_head(ctl.busy, pc1, now)) {
+                let no_op = match ctl.snap {
+                    Some((pc, sp, lr)) => {
+                        // SAFETY: plain reads, as above.
+                        let (r, dirty) = unsafe { (&(*me).regs.r, (*busp).idle.dirty) };
+                        !dirty && (pc1 != pc || r[13] != sp || r[14] != lr)
+                    }
+                    None => ctl.fails_maxed || crate::is_busy_head(ctl.busy, pc1, now),
+                };
+                if !no_op {
                     blocks.stats.chain_stops[6] += 1;
                     break;
                 }
-                // The visit `run_single` would make with no snapshot live:
-                // it clears the flags and drops nothing.
+                // The visit `run_single` would make: it clears the flags and
+                // drops nothing.
                 unsafe {
                     (*busp).idle.dirty = false;
                     (*busp).idle.event = false;
@@ -1520,9 +1561,10 @@ impl CortexM0Plus {
             acc += c as u64;
             i += 1;
             let ends = op.k.ends_block();
-            // A block's only branch is its last op, so `i == n` covers it; faults
-            // set `cx.exit`.
-            if i == n || cx.exit || acc >= budget {
+            // A branch before the last op leaves the block when it does not
+            // go to the next op; faults set `cx.exit`.
+            let left = ends && i < n && self.regs.r[15] != base.wrapping_add(blk.ops[i].off as u32);
+            if i == n || cx.exit || acc >= budget || left {
                 if !ends {
                     self.regs.r[15] = ipc.wrapping_add(op.len());
                 }

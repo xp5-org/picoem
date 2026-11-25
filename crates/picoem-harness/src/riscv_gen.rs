@@ -23,9 +23,9 @@
 // any opcode in the F/D opcode space.
 //
 // Scope of the encoder: RV32I + M + A (single-word AMO format) + C +
-// Zicsr. Zcmp quadrant-2 bit patterns are emitted purely as a
-// decoder-coverage sweep (expected `mcause=2` illegal under Hazard3 V1).
-// No Zba/Zbb/Zbs (follow-up phase).
+// Zicsr + Zba + Zbb + Zbs + Zbkb. Zcmp quadrant-2 bit patterns are emitted
+// purely as a decoder-coverage sweep, expected `mcause=2` illegal until
+// Zcmp lands.
 
 use rand::Rng;
 
@@ -82,12 +82,15 @@ pub enum RiscvClass {
     /// sides (via `warl_mask` for QEMU). See
     /// `wrk_docs/2026.04.18 - HLD - RISC-V PMP Coverage V1.md` V2 §A.
     Pmp,
+    /// Zba, Zbb, Zbs and Zbkb: every RV32 instruction of the four
+    /// bit-manipulation extensions the RP2350 Hazard3 implements.
+    Zb,
 }
 
 impl RiscvClass {
-    /// All twelve variants in a fixed order (matches the LLD §6 table +
-    /// phase-1 PMP addition).
-    pub const ALL: [RiscvClass; 12] = [
+    /// All thirteen variants in a fixed order: the LLD §6 table, then PMP,
+    /// then Zb.
+    pub const ALL: [RiscvClass; 13] = [
         RiscvClass::Rv32iAlu,
         RiscvClass::Rv32iMem,
         RiscvClass::Rv32iMisalignedMem,
@@ -100,6 +103,7 @@ impl RiscvClass {
         RiscvClass::Zifencei,
         RiscvClass::CsrSideEffect,
         RiscvClass::Pmp,
+        RiscvClass::Zb,
     ];
 
     /// Fuzz weight in basis points (sums to 10_000). Per LLD §6 "Fuzz
@@ -114,7 +118,7 @@ impl RiscvClass {
     /// fuzz contamination) that motivated the descope.
     pub fn weight_bp(self) -> u32 {
         match self {
-            RiscvClass::Rv32iAlu => 3000,
+            RiscvClass::Rv32iAlu => 2500,
             RiscvClass::Rv32iMem => 1200,
             RiscvClass::Rv32iMisalignedMem => 500,
             RiscvClass::Rv32iBranch => 1000,
@@ -127,6 +131,7 @@ impl RiscvClass {
             RiscvClass::CsrSideEffect => 300,
             // Phase-2 scope (see module doc above). Reachable via --class pmp.
             RiscvClass::Pmp => 0,
+            RiscvClass::Zb => 500,
         }
     }
 }
@@ -2254,6 +2259,131 @@ pub fn gen_fuzz_pmp<R: Rng>(rng: &mut R, count: usize) -> Vec<RiscvTestCase> {
     out
 }
 
+/// Encoding form of one bit-manipulation instruction.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum ZbForm {
+    /// OPCODE_OP register-register: `funct7`, `funct3`.
+    Reg,
+    /// OPCODE_OP_IMM with a 5-bit shift amount or bit index: `funct7`, `funct3`.
+    Shamt,
+    /// OPCODE_OP_IMM with a fixed 12-bit immediate: `imm12`, `funct3`.
+    Unary,
+}
+
+/// Every RV32 instruction of Zba, Zbb, Zbs and Zbkb as
+/// `mnemonic, form, funct7 or imm12, funct3`. zext.h is pack with rs2 = x0
+/// and is covered by `pack`.
+pub const ZB_OPS: &[(&str, ZbForm, u32, u32)] = &[
+    ("sh1add", ZbForm::Reg, 0b001_0000, 0b010),
+    ("sh2add", ZbForm::Reg, 0b001_0000, 0b100),
+    ("sh3add", ZbForm::Reg, 0b001_0000, 0b110),
+    ("andn", ZbForm::Reg, 0b010_0000, 0b111),
+    ("orn", ZbForm::Reg, 0b010_0000, 0b110),
+    ("xnor", ZbForm::Reg, 0b010_0000, 0b100),
+    ("min", ZbForm::Reg, 0b000_0101, 0b100),
+    ("minu", ZbForm::Reg, 0b000_0101, 0b101),
+    ("max", ZbForm::Reg, 0b000_0101, 0b110),
+    ("maxu", ZbForm::Reg, 0b000_0101, 0b111),
+    ("rol", ZbForm::Reg, 0b011_0000, 0b001),
+    ("ror", ZbForm::Reg, 0b011_0000, 0b101),
+    ("bclr", ZbForm::Reg, 0b010_0100, 0b001),
+    ("bext", ZbForm::Reg, 0b010_0100, 0b101),
+    ("binv", ZbForm::Reg, 0b011_0100, 0b001),
+    ("bset", ZbForm::Reg, 0b001_0100, 0b001),
+    ("pack", ZbForm::Reg, 0b000_0100, 0b100),
+    ("packh", ZbForm::Reg, 0b000_0100, 0b111),
+    ("rori", ZbForm::Shamt, 0b011_0000, 0b101),
+    ("bclri", ZbForm::Shamt, 0b010_0100, 0b001),
+    ("bexti", ZbForm::Shamt, 0b010_0100, 0b101),
+    ("binvi", ZbForm::Shamt, 0b011_0100, 0b001),
+    ("bseti", ZbForm::Shamt, 0b001_0100, 0b001),
+    ("clz", ZbForm::Unary, 0x600, 0b001),
+    ("ctz", ZbForm::Unary, 0x601, 0b001),
+    ("cpop", ZbForm::Unary, 0x602, 0b001),
+    ("sext_b", ZbForm::Unary, 0x604, 0b001),
+    ("sext_h", ZbForm::Unary, 0x605, 0b001),
+    ("zip", ZbForm::Unary, 0x08F, 0b001),
+    ("unzip", ZbForm::Unary, 0x08F, 0b101),
+    ("orc_b", ZbForm::Unary, 0x287, 0b101),
+    ("rev8", ZbForm::Unary, 0x698, 0b101),
+    ("brev8", ZbForm::Unary, 0x687, 0b101),
+];
+
+/// Encode one `ZB_OPS` entry. `rs2_or_shamt` is rs2 for register forms,
+/// the shift amount for shamt forms, and ignored for unary forms.
+pub fn encode_zb(form: ZbForm, sel: u32, f3: u32, rd: u8, rs1: u8, rs2_or_shamt: u8) -> u32 {
+    match form {
+        ZbForm::Reg => encode_r_type(sel, rs2_or_shamt, rs1, f3, rd, OPC_OP),
+        ZbForm::Shamt => encode_r_type(sel, rs2_or_shamt & 0x1F, rs1, f3, rd, OPC_OP_IMM),
+        ZbForm::Unary => encode_i_type(sel as i32, rs1, f3, rd, OPC_OP_IMM),
+    }
+}
+
+/// Zb edge cases: each instruction against operand pairs that hit the
+/// corner cases: zero, all ones, sign bits, shift amounts with bits above
+/// bit 4, and a mixed pattern. rd = x4 keeps x3, the CSR-proxy pointer,
+/// intact.
+pub fn gen_zb_edge_cases() -> Vec<RiscvTestCase> {
+    const PAIRS: [(u32, u32); 5] = [
+        (0x0000_0000, 0x0000_0000),
+        (0xFFFF_FFFF, 0x0000_001F),
+        (0x8000_0080, 0x0000_0021),
+        (0x1234_5678, 0x9ABC_DEF0),
+        (0x0000_FFFF, 0xFFFF_0000),
+    ];
+    const SHAMTS: [u8; 5] = [0, 31, 1, 16, 7];
+    let mut out = Vec::with_capacity(ZB_OPS.len() * PAIRS.len());
+    for &(name, form, sel, f3) in ZB_OPS {
+        for (i, &(a, b)) in PAIRS.iter().enumerate() {
+            let w = encode_zb(form, sel, f3, 4, 1, if form == ZbForm::Shamt { SHAMTS[i] } else { 2 });
+            let mut reg_pre = vec![(1, a)];
+            if form == ZbForm::Reg {
+                reg_pre.push((2, b));
+            }
+            out.push(RiscvTestCase {
+                name: format!("zb_{name}_{i}"),
+                words: vec![w],
+                reg_pre,
+                addr_regs: vec![],
+                expect_trap: None,
+                class: RiscvClass::Zb,
+            });
+        }
+    }
+    out
+}
+
+/// Fuzz generator: Zb, uniform over `ZB_OPS` with random registers,
+/// operands and shift amounts.
+pub fn gen_fuzz_zb<R: Rng>(rng: &mut R, count: usize) -> Vec<RiscvTestCase> {
+    let mut out = Vec::with_capacity(count);
+    for i in 0..count {
+        let (name, form, sel, f3) = ZB_OPS[rng.gen_range(0..ZB_OPS.len())];
+        let rd = rand_gpr(rng);
+        let rs1 = rand_gpr(rng);
+        let rs2 = rand_gpr(rng);
+        let field = match form {
+            ZbForm::Reg => rs2,
+            ZbForm::Shamt => rng.gen_range(0..32_u8),
+            ZbForm::Unary => 0,
+        };
+        let w = encode_zb(form, sel, f3, rd, rs1, field);
+        let mut reg_pre = vec![(rs1, rng.next_u32())];
+        if form == ZbForm::Reg && rs2 != rs1 {
+            reg_pre.push((rs2, rng.next_u32()));
+        }
+        out.push(RiscvTestCase {
+            name: format!("fuzz_zb_{name}_{i}"),
+            words: vec![w],
+            reg_pre,
+            addr_regs: vec![],
+            expect_trap: None,
+            class: RiscvClass::Zb,
+        });
+    }
+    out
+}
+
 // ============================================================================
 // Top-level composition
 // ============================================================================
@@ -2273,6 +2403,7 @@ pub fn generate_edge_cases() -> Vec<RiscvTestCase> {
     out.extend(gen_zifencei_edge_cases());
     out.extend(gen_csr_side_effect_edge_cases());
     out.extend(gen_pmp_edge_cases());
+    out.extend(gen_zb_edge_cases());
     out
 }
 
@@ -2307,6 +2438,7 @@ pub fn generate_fuzz<R: Rng>(rng: &mut R, count: usize) -> Vec<RiscvTestCase> {
             RiscvClass::Zifencei => gen_fuzz_zifencei(rng, n),
             RiscvClass::CsrSideEffect => gen_fuzz_csr_side_effect(rng, n),
             RiscvClass::Pmp => gen_fuzz_pmp(rng, n),
+            RiscvClass::Zb => gen_fuzz_zb(rng, n),
         };
         out.extend(chunk);
     }
@@ -2573,6 +2705,23 @@ mod tests {
     fn edge_cases_csr_side_effect() {
         let cs = gen_csr_side_effect_edge_cases();
         check_class(&cs, RiscvClass::CsrSideEffect, false);
+    }
+
+    #[test]
+    fn edge_cases_zb() {
+        let cs = gen_zb_edge_cases();
+        check_class(&cs, RiscvClass::Zb, false);
+        assert_eq!(cs.len(), ZB_OPS.len() * 5);
+    }
+
+    #[test]
+    fn fuzz_zb_covers_every_op() {
+        let mut rng = StdRng::seed_from_u64(0x2B2B_2B2B);
+        let cs = gen_fuzz_zb(&mut rng, 2000);
+        for &(name, ..) in ZB_OPS {
+            let tag = format!("fuzz_zb_{name}_");
+            assert!(cs.iter().any(|tc| tc.name.starts_with(&tag)), "{name} not generated");
+        }
     }
 
     #[test]
@@ -2988,6 +3137,9 @@ mod tests {
             // PMP fuzz cases are single `csrrw` or paired `csrrw; csrrs`
             // — both words are zicsr-family per the decoder.
             RiscvClass::Pmp => decoded == "zicsr",
+            // Zb words skip the external decoder, which predates the
+            // bit-manipulation extensions; see the property test loop.
+            RiscvClass::Zb => unreachable!("Zb words are checked against ZB_OPS, not riscv-decode"),
             // Rv32c words take the `is_compressed` branch in the property
             // test and never reach `class_compatible`, so this arm is
             // unreachable by construction.
@@ -2995,6 +3147,18 @@ mod tests {
                 "RV32C words are handled via the is_compressed branch, not class_compatible"
             ),
         }
+    }
+
+    /// True when `word` is some `ZB_OPS` entry with its register and shamt
+    /// fields masked out.
+    fn zb_word_matches_table(word: u32) -> bool {
+        ZB_OPS.iter().any(|&(_, form, sel, f3)| {
+            let mask = match form {
+                ZbForm::Reg | ZbForm::Shamt => 0xFE00_707F,
+                ZbForm::Unary => 0xFFF0_707F,
+            };
+            word & mask == encode_zb(form, sel, f3, 0, 0, 0) & mask
+        })
     }
 
     /// Sentinel arm for Zcmp — see LLD §8.  `riscv-decode` does not
@@ -3081,6 +3245,17 @@ mod tests {
                             }
                         }
                     }
+                    continue;
+                }
+                if tc.class == RiscvClass::Zb {
+                    // riscv-decode 0.2.3 has no Zba, Zbb, Zbs or Zbkb, so
+                    // re-derive the word from the ZB_OPS table instead.
+                    assert!(
+                        zb_word_matches_table(word),
+                        "Zb word 0x{word:08X} in {} matches no ZB_OPS entry",
+                        tc.name
+                    );
+                    verified_32bit += 1;
                     continue;
                 }
                 match riscv_decode::decode(word) {
@@ -3248,7 +3423,7 @@ mod tests {
         // Per-arm assertions match LLD §6 exactly. If a phase update
         // shifts the weights, this test must be updated alongside the
         // production change.
-        assert_eq!(RiscvClass::Rv32iAlu.weight_bp(), 3000);
+        assert_eq!(RiscvClass::Rv32iAlu.weight_bp(), 2500);
         assert_eq!(RiscvClass::Rv32iMem.weight_bp(), 1200);
         assert_eq!(RiscvClass::Rv32iMisalignedMem.weight_bp(), 500);
         assert_eq!(RiscvClass::Rv32iBranch.weight_bp(), 1000);
@@ -3260,20 +3435,21 @@ mod tests {
         assert_eq!(RiscvClass::Zifencei.weight_bp(), 200);
         assert_eq!(RiscvClass::CsrSideEffect.weight_bp(), 300);
         assert_eq!(RiscvClass::Pmp.weight_bp(), 0);
+        assert_eq!(RiscvClass::Zb.weight_bp(), 500);
     }
 
     #[test]
-    fn riscv_class_all_has_twelve_unique_variants() {
-        assert_eq!(RiscvClass::ALL.len(), 12);
+    fn riscv_class_all_has_thirteen_unique_variants() {
+        assert_eq!(RiscvClass::ALL.len(), 13);
         // Each variant appears exactly once.
         for c in RiscvClass::ALL {
             let count = RiscvClass::ALL.iter().filter(|x| **x == c).count();
             assert_eq!(count, 1, "duplicate variant in ALL: {c:?}");
         }
-        // Order must place Rv32iAlu first and Pmp last (matches the
-        // LLD §6 table + phase-1 PMP addition).
+        // Order: the LLD §6 table with Rv32iAlu first, then Pmp, then Zb.
         assert_eq!(RiscvClass::ALL[0], RiscvClass::Rv32iAlu);
         assert_eq!(RiscvClass::ALL[11], RiscvClass::Pmp);
+        assert_eq!(RiscvClass::ALL[12], RiscvClass::Zb);
     }
 
     #[test]
@@ -3282,7 +3458,7 @@ mod tests {
         // catch any future remove-derive regression.
         use std::collections::HashSet;
         let s: HashSet<RiscvClass> = RiscvClass::ALL.iter().copied().collect();
-        assert_eq!(s.len(), 12);
+        assert_eq!(s.len(), RiscvClass::ALL.len());
         let dbg = format!("{:?}", RiscvClass::Zicsr);
         assert!(dbg.contains("Zicsr"));
     }

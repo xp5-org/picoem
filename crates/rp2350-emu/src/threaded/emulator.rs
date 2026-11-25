@@ -139,6 +139,9 @@ impl ThreadedEmulator {
             #[cfg(feature = "testing")]
                 pending_panic_inject: _,
             bus_is_placeholder: _,
+            // The GPIO edge log is a single-threaded debug view; threaded runs do not log edges.
+            gpio_edges: _,
+            gpio_inline: _,
             shutdown_requested,
         } = emu;
         // ThreadedEmulator currently only supports the Arm arm — RISC-V

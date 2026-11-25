@@ -13,7 +13,7 @@ use crate::bus::canon_oracle_addr;
 use super::Hazard3;
 use super::csr::{CsrAccess, csr_access};
 use super::decode::{
-    AluImmKind, AluKind, AmoKind, BranchKind, CsrKind, LoadKind, MulDivKind, Op, ShiftKind,
+    AluImmKind, AluKind, AmoKind, BitKind, BranchKind, CsrKind, LoadKind, MulDivKind, Op, ShiftKind,
     StoreKind,
 };
 use super::trap::cause;
@@ -240,6 +240,18 @@ impl Hazard3 {
                     AluKind::And => a & b,
                 };
                 self.wr(rd, r);
+            }
+
+            Op::Bit {
+                kind,
+                rd,
+                rs1,
+                rs2,
+                imm,
+            } => {
+                let a = self.rd_x(rs1);
+                let b = if imm { rs2 as u32 } else { self.rd_x(rs2) };
+                self.wr(rd, exec_bit(kind, a, b));
             }
 
             Op::MulDiv { kind, rd, rs1, rs2 } => {
@@ -506,6 +518,66 @@ fn exec_muldiv(kind: MulDivKind, a: u32, b: u32) -> u32 {
             } else {
                 a % b
             }
+        }
+    }
+}
+
+/// Zba, Zbb, Zbs and Zbkb semantics on RV32. `b` is the rs2 value for
+/// register forms and the immediate for immediate forms; unary forms
+/// ignore it. Shift amounts and bit indices use the low five bits.
+#[inline]
+fn exec_bit(kind: BitKind, a: u32, b: u32) -> u32 {
+    let sh = b & 0x1F;
+    match kind {
+        BitKind::Sh1add => (a << 1).wrapping_add(b),
+        BitKind::Sh2add => (a << 2).wrapping_add(b),
+        BitKind::Sh3add => (a << 3).wrapping_add(b),
+        BitKind::Andn => a & !b,
+        BitKind::Orn => a | !b,
+        BitKind::Xnor => !(a ^ b),
+        BitKind::Clz => a.leading_zeros(),
+        BitKind::Ctz => a.trailing_zeros(),
+        BitKind::Cpop => a.count_ones(),
+        BitKind::Max => (a as i32).max(b as i32) as u32,
+        BitKind::Maxu => a.max(b),
+        BitKind::Min => (a as i32).min(b as i32) as u32,
+        BitKind::Minu => a.min(b),
+        BitKind::SextB => a as u8 as i8 as i32 as u32,
+        BitKind::SextH => a as u16 as i16 as i32 as u32,
+        BitKind::Rol => a.rotate_left(sh),
+        BitKind::Ror => a.rotate_right(sh),
+        BitKind::OrcB => {
+            let mut r = 0;
+            for i in 0..4 {
+                if (a >> (8 * i)) & 0xFF != 0 {
+                    r |= 0xFF << (8 * i);
+                }
+            }
+            r
+        }
+        BitKind::Rev8 => a.swap_bytes(),
+        BitKind::Bclr => a & !(1 << sh),
+        BitKind::Bext => (a >> sh) & 1,
+        BitKind::Binv => a ^ (1 << sh),
+        BitKind::Bset => a | (1 << sh),
+        BitKind::Pack => (a & 0xFFFF) | (b << 16),
+        BitKind::Packh => (a & 0xFF) | ((b & 0xFF) << 8),
+        BitKind::Brev8 => a.swap_bytes().reverse_bits(),
+        BitKind::Zip => {
+            let mut r = 0;
+            for i in 0..16 {
+                r |= ((a >> i) & 1) << (2 * i);
+                r |= ((a >> (i + 16)) & 1) << (2 * i + 1);
+            }
+            r
+        }
+        BitKind::Unzip => {
+            let mut r = 0;
+            for i in 0..16 {
+                r |= ((a >> (2 * i)) & 1) << i;
+                r |= ((a >> (2 * i + 1)) & 1) << (i + 16);
+            }
+            r
         }
     }
 }

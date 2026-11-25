@@ -22,6 +22,8 @@ mod tests_p3;
 mod tests_p4;
 #[cfg(test)]
 mod tests_p5;
+#[cfg(test)]
+mod tests_bitmanip;
 
 use crate::Bus;
 use irq::Xh3Irq;

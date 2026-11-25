@@ -71,3 +71,4 @@ __pycache__/
 # full_test_rp2350 markdown reports: program output (timestamped phase
 # summaries written by the binary at runtime), not source. Local-only.
 crates/picoem-harness/tests/results/
+*.lock

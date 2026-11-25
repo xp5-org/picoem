@@ -1,4 +1,5 @@
-// RV32I + Zicsr + Zifencei + M + A + C decoder for Hazard3. This is
+// RV32I + Zicsr + Zifencei + M + A + C + Zba + Zbb + Zbs + Zbkb decoder
+// for Hazard3. This is
 // pure decode: it maps a 16-bit or 32-bit instruction word into an `Op`
 // enum. The executor in `execute.rs` consumes the result. Unknown
 // encodings decode to `Op::Illegal { insn }` so the executor can emit
@@ -130,6 +131,17 @@ pub(crate) enum Op {
         rl: bool,
     },
 
+    // Zba, Zbb, Zbs and Zbkb. Register forms read rs2; immediate forms
+    // carry the shift amount or bit index in `rs2` with `imm` set; unary
+    // forms such as clz ignore it.
+    Bit {
+        kind: BitKind,
+        rd: u8,
+        rs1: u8,
+        rs2: u8,
+        imm: bool,
+    },
+
     // MISC-MEM
     Fence,
     FenceI,
@@ -221,6 +233,42 @@ pub(crate) enum MulDivKind {
     Divu,
     Rem,
     Remu,
+}
+
+/// Bit-manipulation operations from Zba, Zbb, Zbs and Zbkb, the set the
+/// RP2350 Hazard3 implements. zext.h is pack with rs2 = x0, so it decodes
+/// as `Pack`. Operations shared by Zbb and Zbkb, such as rol, ror, andn
+/// and rev8, appear once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BitKind {
+    Sh1add,
+    Sh2add,
+    Sh3add,
+    Andn,
+    Orn,
+    Xnor,
+    Clz,
+    Ctz,
+    Cpop,
+    Max,
+    Maxu,
+    Min,
+    Minu,
+    SextB,
+    SextH,
+    Rol,
+    Ror,
+    OrcB,
+    Rev8,
+    Bclr,
+    Bext,
+    Binv,
+    Bset,
+    Pack,
+    Packh,
+    Brev8,
+    Zip,
+    Unzip,
 }
 
 /// RV32A word-sized operations. LR/SC don't carry an rs2 address-operand
@@ -436,10 +484,10 @@ fn decode_op_imm(insn: u32) -> Op {
     // Shift forms are funct3 == 001 (SLLI) / 101 (SRLI/SRAI) and share
     // the OP-IMM opcode but carry a shamt + funct7 discriminator.
     if f3 == 0b001 {
-        // SLLI: funct7 must be 0000000 (RV32I). With C/B extensions later
-        // this check tightens.
+        // SLLI has funct7 0000000; every other funct7 is a bit-manipulation
+        // immediate or unary form, or illegal.
         if funct7(insn) != 0b000_0000 {
-            return Op::Illegal { insn };
+            return decode_op_imm_bit(insn);
         }
         let shamt = ((insn >> 20) & 0x1F) as u8;
         return Op::ShiftImm {
@@ -455,7 +503,7 @@ fn decode_op_imm(insn: u32) -> Op {
         let kind = match f7 {
             0b000_0000 => ShiftKind::Srli,
             0b010_0000 => ShiftKind::Srai,
-            _ => return Op::Illegal { insn },
+            _ => return decode_op_imm_bit(insn),
         };
         return Op::ShiftImm {
             kind,
@@ -519,13 +567,83 @@ fn decode_op(insn: u32) -> Op {
         (0b101, 0b010_0000) => AluKind::Sra,
         (0b110, 0b000_0000) => AluKind::Or,
         (0b111, 0b000_0000) => AluKind::And,
-        _ => return Op::Illegal { insn },
+        _ => return decode_op_bit(insn),
     };
     Op::Op {
         kind,
         rd: rd_,
         rs1: rs1_,
         rs2: rs2_,
+    }
+}
+
+/// Register-register bit-manipulation forms under OPCODE_OP, selected by
+/// funct7 and funct3. zext.h is pack with rs2 = x0.
+fn decode_op_bit(insn: u32) -> Op {
+    let kind = match (funct3(insn), funct7(insn)) {
+        (0b010, 0b001_0000) => BitKind::Sh1add,
+        (0b100, 0b001_0000) => BitKind::Sh2add,
+        (0b110, 0b001_0000) => BitKind::Sh3add,
+        (0b111, 0b010_0000) => BitKind::Andn,
+        (0b110, 0b010_0000) => BitKind::Orn,
+        (0b100, 0b010_0000) => BitKind::Xnor,
+        (0b100, 0b000_0101) => BitKind::Min,
+        (0b101, 0b000_0101) => BitKind::Minu,
+        (0b110, 0b000_0101) => BitKind::Max,
+        (0b111, 0b000_0101) => BitKind::Maxu,
+        (0b001, 0b011_0000) => BitKind::Rol,
+        (0b101, 0b011_0000) => BitKind::Ror,
+        (0b001, 0b010_0100) => BitKind::Bclr,
+        (0b101, 0b010_0100) => BitKind::Bext,
+        (0b001, 0b011_0100) => BitKind::Binv,
+        (0b001, 0b001_0100) => BitKind::Bset,
+        (0b100, 0b000_0100) => BitKind::Pack,
+        (0b111, 0b000_0100) => BitKind::Packh,
+        _ => return Op::Illegal { insn },
+    };
+    Op::Bit {
+        kind,
+        rd: rd(insn),
+        rs1: rs1(insn),
+        rs2: rs2(insn),
+        imm: false,
+    }
+}
+
+/// Immediate and unary bit-manipulation forms under OPCODE_OP_IMM with
+/// funct3 001 or 101. Shift-amount forms take shamt from bits 24:20 with
+/// funct7 as the selector; unary forms are fixed 12-bit immediates.
+fn decode_op_imm_bit(insn: u32) -> Op {
+    let f3 = funct3(insn);
+    let f7 = funct7(insn);
+    let imm12 = (insn >> 20) & 0xFFF;
+    let shamt = rs2(insn);
+    let kind = match (f3, f7) {
+        (0b001, 0b010_0100) => BitKind::Bclr,
+        (0b001, 0b011_0100) => BitKind::Binv,
+        (0b001, 0b001_0100) => BitKind::Bset,
+        (0b101, 0b010_0100) => BitKind::Bext,
+        (0b101, 0b011_0000) => BitKind::Ror,
+        _ => match (f3, imm12) {
+            (0b001, 0x600) => BitKind::Clz,
+            (0b001, 0x601) => BitKind::Ctz,
+            (0b001, 0x602) => BitKind::Cpop,
+            (0b001, 0x604) => BitKind::SextB,
+            (0b001, 0x605) => BitKind::SextH,
+            (0b001, 0x08F) => BitKind::Zip,
+            (0b101, 0x08F) => BitKind::Unzip,
+            (0b101, 0x287) => BitKind::OrcB,
+            (0b101, 0x698) => BitKind::Rev8,
+            (0b101, 0x687) => BitKind::Brev8,
+            _ => return Op::Illegal { insn },
+        },
+    };
+    Op::Bit {
+        kind,
+        rd: rd(insn),
+        rs1: rs1(insn),
+        rs2: shamt,
+        imm: true,
     }
 }
 

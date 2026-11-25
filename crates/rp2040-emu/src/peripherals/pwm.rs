@@ -140,6 +140,11 @@ pub struct PwmRegs {
     inte: u8,
     intf: u8,
     nvic_irq: u32,
+    /// Enabled slices, valid while `wrap_in` is not 0.
+    en_mask: u8,
+    /// Cycles before the first enabled slice wraps, as of the last tick;
+    /// 0 when unknown, which every register write makes it.
+    wrap_in: u32,
 }
 
 impl PwmRegs {
@@ -152,6 +157,8 @@ impl PwmRegs {
             inte: 0,
             intf: 0,
             nvic_irq,
+            en_mask: 0,
+            wrap_in: 0,
         }
     }
 
@@ -236,6 +243,7 @@ impl PwmRegs {
     // --- Register writes -----------------------------------------------
 
     pub fn write32(&mut self, offset: u32, value: u32, alias: u32, irqs: &mut u32) {
+        self.wrap_in = 0;
         if let Some((slice, inner)) = Self::decode_slice_offset(offset) {
             match inner {
                 SLICE_CSR => {
@@ -339,6 +347,18 @@ impl PwmRegs {
             self.route_irq(irqs);
             return;
         }
+        // No enabled slice wraps in this tick: each counter only moves on.
+        if cycles < self.wrap_in {
+            self.wrap_in -= cycles;
+            let mut m = self.en_mask;
+            while m != 0 {
+                let s = &mut self.slices[m.trailing_zeros() as usize];
+                m &= m - 1;
+                s.ctr = (s.ctr as u32 + cycles) as u16;
+            }
+            self.route_irq(irqs);
+            return;
+        }
         for slice_idx in 0..PWM_SLICE_COUNT {
             let slice = &mut self.slices[slice_idx];
             // PWM_EN and CHn_CSR.EN share physical storage (datasheet
@@ -346,31 +366,45 @@ impl PwmRegs {
             if (slice.csr & CSR_EN) == 0 {
                 continue;
             }
-            let top = slice.top as u64;
+            // Counters are 16 bits wide, so for a quantum-sized tick the
+            // division, needed when a slice wraps more than once, is a
+            // 32-bit one.
+            let top = slice.top as u32;
             let period = top + 1;
-            let old_ctr = slice.ctr as u64;
+            let old_ctr = slice.ctr as u32;
             // New counter position after `cycles` advances, modulo one
             // period. With TOP=0 the period is 1 and every cycle wraps.
             // A quantum is usually shorter than a period, so the division
             // is the rare case.
-            let sum = old_ctr + cycles as u64;
-            let new_ctr = if sum < period {
-                sum
-            } else if sum < 2 * period {
-                sum - period
+            let sum = old_ctr as u64 + cycles as u64;
+            let new_ctr = if sum < period as u64 {
+                sum as u32
+            } else if sum < 2 * period as u64 {
+                (sum - period as u64) as u32
+            } else if let Ok(s32) = u32::try_from(sum) {
+                s32 % period
             } else {
-                sum % period
+                (sum % period as u64) as u32
             };
             // The first wrap happens at offset `top + 1 - old_ctr`
             // sys_clks from now. Any `cycles >= that offset` triggers
             // at least one wrap.
-            let to_first_wrap = period - old_ctr;
-            let wrapped = (cycles as u64) >= to_first_wrap;
+            let to_first_wrap = period.wrapping_sub(old_ctr);
+            let wrapped = cycles >= to_first_wrap;
             slice.ctr = new_ctr as u16;
             if wrapped {
                 self.latch_wrap(slice_idx);
             }
         }
+        let (mut mask, mut wrap_in) = (0u8, u32::MAX);
+        for (i, s) in self.slices.iter().enumerate() {
+            if s.csr & CSR_EN != 0 {
+                mask |= 1 << i;
+                wrap_in = wrap_in.min((s.top as u32 + 1).saturating_sub(s.ctr as u32));
+            }
+        }
+        self.en_mask = mask;
+        self.wrap_in = wrap_in;
         self.route_irq(irqs);
     }
 }
